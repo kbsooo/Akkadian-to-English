@@ -198,9 +198,21 @@ def normalize_transliteration(text: str) -> str:
 # ## 4. Load Model
 
 #%%
+from transformers import ByT5Tokenizer
+
 print(f"🤖 Loading model from {MODEL_DIR}")
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+# Load tokenizer with fallback for version compatibility
+# ByT5 uses byte-level tokenization, so we can use ByT5Tokenizer directly
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
+    print("   ✅ Tokenizer loaded from model directory")
+except Exception as e:
+    print(f"   ⚠️ AutoTokenizer failed: {e}")
+    print("   ℹ️ Using ByT5Tokenizer() directly (byte-level, no vocab needed)")
+    tokenizer = ByT5Tokenizer()
+
+# Load model
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR)
 
 # Move to device
