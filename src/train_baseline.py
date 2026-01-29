@@ -4,8 +4,13 @@
 # Usage (Tier3 default):
 #   uv run python src/train_baseline.py --data-dir src/outputs --tier tier3
 #
+# Multi-GPU (2x T4 on Kaggle):
+#   torchrun --nproc_per_node=2 src/train_baseline.py --data-dir src/outputs --tier tier3
+#   # or
+#   accelerate launch src/train_baseline.py --data-dir src/outputs --tier tier3
+#
 # Optional:
-#   --model-name google/byt5-small
+#   --model-name google/byt5-base
 #   --out-dir src/outputs/baseline_tier3
 #   --epochs 5 --batch-size 4 --lr 3e-4
 #   --max-source-length 256 --max-target-length 256
@@ -20,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,13 +54,13 @@ import inspect
 
 @dataclass
 class TrainConfig:
-    model_name: str = "google/byt5-small"
+    model_name: str = "google/byt5-base"
     seed: int = 42
     val_frac: float = 0.1
     max_source_length: int = 256
     max_target_length: int = 256
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 2
+    batch_size: int = 2
+    gradient_accumulation_steps: int = 4
     epochs: int = 5
     lr: float = 3e-4
     weight_decay: float = 0.01
@@ -214,6 +220,11 @@ def train_baseline(
 
     if torch.cuda.is_available():
         torch.set_float32_matmul_precision("high")
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 1 and "LOCAL_RANK" not in os.environ:
+            print(f"[Info] Detected {n_gpus} GPUs. For full DDP, run with:")
+            print("  torchrun --nproc_per_node=2 src/train_baseline.py ...")
+            print("  or accelerate launch src/train_baseline.py ...")
 
     train_ds, val_ds = build_datasets(df, tokenizer, cfg, use_tagged)
 
@@ -222,6 +233,12 @@ def train_baseline(
     # Handle HF arg name changes (evaluation_strategy -> eval_strategy)
     arg_sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
     eval_key = "evaluation_strategy" if "evaluation_strategy" in arg_sig.parameters else "eval_strategy"
+
+    # Warmup steps from ratio to avoid deprecated warmup_ratio
+    steps_per_epoch = math.ceil(len(train_ds) / max(1, cfg.batch_size))
+    steps_per_epoch = math.ceil(steps_per_epoch / max(1, cfg.gradient_accumulation_steps))
+    total_steps = max(1, steps_per_epoch * cfg.epochs)
+    warmup_steps = int(total_steps * cfg.warmup_ratio)
 
     args_kwargs = dict(
         output_dir=str(out_dir),
@@ -232,7 +249,7 @@ def train_baseline(
         gradient_accumulation_steps=cfg.gradient_accumulation_steps,
         num_train_epochs=cfg.epochs,
         weight_decay=cfg.weight_decay,
-        warmup_ratio=cfg.warmup_ratio,
+        warmup_steps=warmup_steps,
         predict_with_generate=cfg.predict_with_generate,
         logging_steps=20,
         save_total_limit=2,
@@ -245,6 +262,11 @@ def train_baseline(
         gradient_checkpointing=gradient_checkpointing,
     )
     args_kwargs[eval_key] = cfg.eval_strategy
+
+    # Multi-GPU safe settings when available
+    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        if "ddp_find_unused_parameters" in arg_sig.parameters:
+            args_kwargs["ddp_find_unused_parameters"] = False
 
     args = Seq2SeqTrainingArguments(**args_kwargs)
 
@@ -323,16 +345,18 @@ def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Baseline Seq2Seq training")
     p.add_argument("--data-dir", type=str, default="src/outputs")
     p.add_argument("--tier", type=str, default="tier3", choices=["tier1", "tier2", "tier3"])
-    p.add_argument("--model-name", type=str, default="google/byt5-small")
+    p.add_argument("--model-name", type=str, default="google/byt5-base")
     p.add_argument("--out-dir", type=str, default="src/outputs/baseline")
     p.add_argument("--epochs", type=int, default=5)
-    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--batch-size", type=int, default=2)
+    p.add_argument("--grad-accum", type=int, default=4)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--max-source-length", type=int, default=256)
     p.add_argument("--max-target-length", type=int, default=256)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--val-frac", type=float, default=0.1)
     p.add_argument("--use-tagged", action="store_true")
+    p.add_argument("--no-auto-fp16", action="store_true")
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--torch-compile", action="store_true")
@@ -350,11 +374,17 @@ def main() -> None:
         max_source_length=args.max_source_length,
         max_target_length=args.max_target_length,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=args.grad_accum,
         epochs=args.epochs,
         lr=args.lr,
     )
 
     out_dir = Path(args.out_dir) / args.tier
+
+    auto_fp16 = not args.no_auto_fp16
+    use_fp16 = args.fp16
+    if auto_fp16 and torch.cuda.is_available() and not args.bf16:
+        use_fp16 = True
 
     train_baseline(
         data_dir=Path(args.data_dir),
@@ -362,7 +392,7 @@ def main() -> None:
         tier=args.tier,
         cfg=cfg,
         use_tagged=args.use_tagged,
-        use_fp16=args.fp16,
+        use_fp16=use_fp16,
         use_bf16=args.bf16,
         use_torch_compile=args.torch_compile,
         gradient_checkpointing=args.gradient_checkpointing,
