@@ -27,7 +27,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -93,9 +93,11 @@ def find_competition_data() -> Path:
 
 def find_model_dir() -> Path:
     """Find trained model directory."""
-    # Option 1: Explicit path
-    if CFG.model_path and CFG.model_path.exists():
-        return CFG.model_path
+    # Option 1: Explicit path (handle both str and Path)
+    if CFG.model_path:
+        model_path = Path(CFG.model_path) if isinstance(CFG.model_path, str) else CFG.model_path
+        if model_path.exists():
+            return model_path
     
     # Option 2: Dataset name
     if CFG.model_dataset_name:
