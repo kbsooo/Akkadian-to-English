@@ -38,6 +38,7 @@ from transformers import (
     Seq2SeqTrainingArguments,
     set_seed,
 )
+import inspect
 
 #%%
 # -----------------------------
@@ -218,9 +219,12 @@ def train_baseline(
 
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
-    args = Seq2SeqTrainingArguments(
+    # Handle HF arg name changes (evaluation_strategy -> eval_strategy)
+    arg_sig = inspect.signature(Seq2SeqTrainingArguments.__init__)
+    eval_key = "evaluation_strategy" if "evaluation_strategy" in arg_sig.parameters else "eval_strategy"
+
+    args_kwargs = dict(
         output_dir=str(out_dir),
-        evaluation_strategy=cfg.eval_strategy,
         save_strategy=cfg.save_strategy,
         learning_rate=cfg.lr,
         per_device_train_batch_size=cfg.batch_size,
@@ -240,16 +244,27 @@ def train_baseline(
         report_to="none",
         gradient_checkpointing=gradient_checkpointing,
     )
+    args_kwargs[eval_key] = cfg.eval_strategy
 
-    trainer = Seq2SeqTrainer(
+    args = Seq2SeqTrainingArguments(**args_kwargs)
+
+    trainer_kwargs = dict(
         model=model,
         args=args,
         train_dataset=train_ds,
         eval_dataset=val_ds,
-        tokenizer=tokenizer,
         data_collator=data_collator,
         compute_metrics=build_metrics(tokenizer),
     )
+
+    # Transformers API compatibility: tokenizer arg was removed in newer versions.
+    trainer_sig = inspect.signature(Seq2SeqTrainer.__init__)
+    if "tokenizer" in trainer_sig.parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+    elif "processing_class" in trainer_sig.parameters:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = Seq2SeqTrainer(**trainer_kwargs)
 
     trainer.train()
     metrics = trainer.evaluate()
