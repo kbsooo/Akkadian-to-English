@@ -9,6 +9,10 @@
 #   # or
 #   accelerate launch src/train_baseline.py --data-dir src/outputs --tier tier3
 #
+# Kaggle defaults:
+# - data dir: /kaggle/working/outputs if present, else /kaggle/input/*/outputs
+# - out dir:  /kaggle/working/baseline
+#
 # Optional:
 #   --model-name google/byt5-base
 #   --out-dir src/outputs/baseline_tier3
@@ -69,6 +73,8 @@ class TrainConfig:
     save_strategy: str = "epoch"
     predict_with_generate: bool = True
     gradient_checkpointing: bool = False
+    dataloader_num_workers: int = 2
+    save_total_limit: int = 2
 
 
 #%%
@@ -90,6 +96,30 @@ def load_tier(data_dir: Path, tier: str) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(path)
     return pd.read_csv(path)
+
+
+def _is_kaggle() -> bool:
+    return os.environ.get("KAGGLE_KERNEL_RUN_TYPE") is not None
+
+
+def _default_data_dir() -> Path:
+    # Kaggle: prefer /kaggle/working/outputs, else search /kaggle/input/*/outputs
+    if _is_kaggle():
+        working = Path("/kaggle/working/outputs")
+        if working.exists():
+            return working
+        input_root = Path("/kaggle/input")
+        if input_root.exists():
+            for p in input_root.iterdir():
+                cand = p / "outputs"
+                if cand.exists():
+                    return cand
+        return Path("/kaggle/working")
+    return Path("src/outputs")
+
+
+def _default_out_dir() -> Path:
+    return Path("/kaggle/working/baseline") if _is_kaggle() else Path("src/outputs/baseline")
 
 
 def group_split(df: pd.DataFrame, group_col: str, val_frac: float, seed: int) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -252,7 +282,7 @@ def train_baseline(
         warmup_steps=warmup_steps,
         predict_with_generate=cfg.predict_with_generate,
         logging_steps=20,
-        save_total_limit=2,
+        save_total_limit=cfg.save_total_limit,
         fp16=use_fp16,
         bf16=use_bf16,
         load_best_model_at_end=True,
@@ -260,6 +290,7 @@ def train_baseline(
         greater_is_better=True,
         report_to="none",
         gradient_checkpointing=gradient_checkpointing,
+        dataloader_num_workers=cfg.dataloader_num_workers,
     )
     args_kwargs[eval_key] = cfg.eval_strategy
 
@@ -343,10 +374,10 @@ def train_baseline(
 
 def build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Baseline Seq2Seq training")
-    p.add_argument("--data-dir", type=str, default="src/outputs")
+    p.add_argument("--data-dir", type=str, default=str(_default_data_dir()))
     p.add_argument("--tier", type=str, default="tier3", choices=["tier1", "tier2", "tier3"])
     p.add_argument("--model-name", type=str, default="google/byt5-base")
-    p.add_argument("--out-dir", type=str, default="src/outputs/baseline")
+    p.add_argument("--out-dir", type=str, default=str(_default_out_dir()))
     p.add_argument("--epochs", type=int, default=5)
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--grad-accum", type=int, default=4)
@@ -361,6 +392,8 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--bf16", action="store_true")
     p.add_argument("--torch-compile", action="store_true")
     p.add_argument("--gradient-checkpointing", action="store_true")
+    p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--save-total-limit", type=int, default=2)
     return p
 
 
@@ -377,6 +410,8 @@ def main() -> None:
         gradient_accumulation_steps=args.grad_accum,
         epochs=args.epochs,
         lr=args.lr,
+        dataloader_num_workers=args.num_workers,
+        save_total_limit=args.save_total_limit,
     )
 
     out_dir = Path(args.out_dir) / args.tier
