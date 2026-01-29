@@ -50,7 +50,20 @@ class AlignConfig:
     max_ratio_short: float = 5.0
     short_token_threshold: int = 6
     target_ratio: float = 1.5  # average tgt/src token ratio
-    max_tgt_merge: int = 3
+    max_tgt_merge: int = 5
+    max_src_merge: int = 3
+
+
+@dataclass
+class QualityConfig:
+    min_quality: float = 0.0
+    max_gap_ratio: float = 0.5
+    max_unk_ratio: float = 0.3
+    length_weight: float = 0.3
+    gap_weight: float = 0.4
+    unk_weight: float = 0.2
+    number_penalty: float = 0.1
+    annotated_bonus: float = 0.05
 
 
 #%%
@@ -231,6 +244,7 @@ def split_by_boundaries(text: str, boundaries: Sequence[int]) -> List[str]:
 
 def split_translation_into_sentences(text: str) -> List[str]:
     # Simple sentence splitter with punctuation + key headings
+    text = text.replace("\n", " ")
     chunks = re.split(r"(?<=[\.;:!?])\s+", text)
     return [c.strip() for c in chunks if c.strip()]
 
@@ -238,28 +252,47 @@ def split_translation_into_sentences(text: str) -> List[str]:
 def align_by_length(src_segs: List[str], tgt_segs: List[str], cfg: AlignConfig) -> List[Tuple[str, str]]:
     # Insight: monotonic alignment with local merges is stable for noisy OCR.
     pairs: List[Tuple[str, str]] = []
-    i = 0
-    j = 0
+    i, j = 0, 0
     while i < len(src_segs) and j < len(tgt_segs):
-        src = src_segs[i]
-        best_tgt = tgt_segs[j]
-        best_k = 0
-        best_score = abs(len(best_tgt.split()) / max(1, len(src.split())) - cfg.target_ratio)
+        src_accum = src_segs[i]
+        tgt_accum = tgt_segs[j]
+        src_i, tgt_i = i, j
+        src_merge = 0
+        tgt_merge = 0
 
-        accum = best_tgt
-        for k in range(1, cfg.max_tgt_merge):
-            if j + k >= len(tgt_segs):
-                break
-            accum = accum + " " + tgt_segs[j + k]
-            score = abs(len(accum.split()) / max(1, len(src.split())) - cfg.target_ratio)
-            if score <= best_score:
-                best_score = score
-                best_tgt = accum
-                best_k = k
+        while True:
+            src_tokens = len(src_accum.split()) or 1
+            tgt_tokens = len(tgt_accum.split()) or 1
+            ratio = tgt_tokens / src_tokens
 
-        pairs.append((src, best_tgt))
-        i += 1
-        j += best_k + 1
+            if ratio > cfg.max_ratio and src_i + 1 < len(src_segs) and src_merge < cfg.max_src_merge:
+                src_i += 1
+                src_merge += 1
+                src_accum = src_accum + " " + src_segs[src_i]
+                continue
+
+            if ratio < cfg.min_ratio and tgt_i + 1 < len(tgt_segs) and tgt_merge < cfg.max_tgt_merge:
+                tgt_i += 1
+                tgt_merge += 1
+                tgt_accum = tgt_accum + " " + tgt_segs[tgt_i]
+                continue
+
+            # Optional fine-tune: try one more tgt merge if it improves target_ratio and keeps bounds
+            if tgt_i + 1 < len(tgt_segs) and tgt_merge < cfg.max_tgt_merge:
+                candidate = tgt_accum + " " + tgt_segs[tgt_i + 1]
+                cand_ratio = (len(candidate.split()) or 1) / (len(src_accum.split()) or 1)
+                if cfg.min_ratio <= cand_ratio <= cfg.max_ratio:
+                    if abs(cand_ratio - cfg.target_ratio) < abs(ratio - cfg.target_ratio):
+                        tgt_i += 1
+                        tgt_merge += 1
+                        tgt_accum = candidate
+                        continue
+
+            break
+
+        pairs.append((src_accum, tgt_accum))
+        i = src_i + 1
+        j = tgt_i + 1
 
     return pairs
 
@@ -446,7 +479,12 @@ def create_sentence_pairs(
     return pd.DataFrame(pairs)
 
 
-def preprocess_pairs(df: pd.DataFrame, norm_cfg: NormalizeConfig, align_cfg: AlignConfig) -> pd.DataFrame:
+def preprocess_pairs(
+    df: pd.DataFrame,
+    norm_cfg: NormalizeConfig,
+    align_cfg: AlignConfig,
+    quality_cfg: QualityConfig,
+) -> pd.DataFrame:
     df = df.copy()
     df["src_raw"] = df["transliteration"]
     df["tgt_raw"] = df["translation"]
@@ -465,7 +503,78 @@ def preprocess_pairs(df: pd.DataFrame, norm_cfg: NormalizeConfig, align_cfg: Ali
     df["is_valid"] = [v[0] for v in validations]
     df["issues"] = [v[1] for v in validations]
 
+    df["length_ratio_tok"] = df.apply(
+        lambda r: _token_ratio(r["src_norm"], r["tgt_norm"]), axis=1
+    )
+    df["gap_ratio"] = df["src_norm"].apply(_gap_ratio)
+    df["unk_ratio"] = df["src_norm"].apply(_unk_ratio)
+
+    df["quality_score"] = df.apply(
+        lambda r: score_pair(
+            r["src_norm"],
+            r["tgt_norm"],
+            align_cfg,
+            quality_cfg,
+            r["source"],
+            r["issues"],
+        ),
+        axis=1,
+    )
+
+    df["quality_pass"] = df["quality_score"] >= quality_cfg.min_quality
+    df["quality_pass"] &= df["gap_ratio"] <= quality_cfg.max_gap_ratio
+    df["quality_pass"] &= df["unk_ratio"] <= quality_cfg.max_unk_ratio
+
     return df
+
+
+def _token_ratio(src: str, tgt: str) -> float:
+    src_tokens = src.split()
+    tgt_tokens = tgt.split()
+    return len(tgt_tokens) / max(1, len(src_tokens))
+
+
+def _gap_ratio(src: str) -> float:
+    tokens = src.split()
+    if not tokens:
+        return 0.0
+    gap = sum(1 for t in tokens if t in {"<gap>", "<big_gap>"})
+    return gap / len(tokens)
+
+
+def _unk_ratio(src: str) -> float:
+    tokens = src.split()
+    if not tokens:
+        return 0.0
+    unk = sum(1 for t in tokens if t == "<unk_sign>")
+    return unk / len(tokens)
+
+
+def score_pair(
+    src: str,
+    tgt: str,
+    align_cfg: AlignConfig,
+    quality_cfg: QualityConfig,
+    source: str,
+    issues: List[str],
+) -> float:
+    # Score in [0, 1], higher is better.
+    ratio = _token_ratio(src, tgt)
+    ratio_dev = abs(ratio - align_cfg.target_ratio) / max(align_cfg.target_ratio, 1e-6)
+    gap_r = _gap_ratio(src)
+    unk_r = _unk_ratio(src)
+
+    score = 1.0
+    score -= min(1.0, ratio_dev) * quality_cfg.length_weight
+    score -= min(1.0, gap_r / max(quality_cfg.max_gap_ratio, 1e-6)) * quality_cfg.gap_weight
+    score -= min(1.0, unk_r / max(quality_cfg.max_unk_ratio, 1e-6)) * quality_cfg.unk_weight
+
+    if "number_mismatch" in issues:
+        score -= quality_cfg.number_penalty
+    if source == "annotated":
+        score += quality_cfg.annotated_bonus
+
+    return max(0.0, min(1.0, score))
 
 
 #%%
@@ -483,7 +592,7 @@ def plot_length_distributions(df: pd.DataFrame, out_dir: Path) -> None:
 
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     axes[0].hist(df["src_norm"].str.split().str.len(), bins=40)
     axes[0].set_title("Src token length")
     axes[0].set_xlabel("tokens")
@@ -491,6 +600,11 @@ def plot_length_distributions(df: pd.DataFrame, out_dir: Path) -> None:
     axes[1].hist(df["tgt_norm"].str.split().str.len(), bins=40)
     axes[1].set_title("Tgt token length")
     axes[1].set_xlabel("tokens")
+
+    if "quality_score" in df.columns:
+        axes[2].hist(df["quality_score"], bins=40)
+        axes[2].set_title("Quality score")
+        axes[2].set_xlabel("score")
 
     fig.tight_layout()
     fig.savefig(out_dir / "length_distributions.png", dpi=150)
@@ -512,6 +626,9 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--no-normalize-h", action="store_true")
     p.add_argument("--no-normalize-subscripts", action="store_true")
     p.add_argument("--plot", action="store_true")
+    p.add_argument("--min-quality", type=float, default=0.0)
+    p.add_argument("--max-gap-ratio", type=float, default=0.5)
+    p.add_argument("--max-unk-ratio", type=float, default=0.3)
     return p
 
 
@@ -536,24 +653,31 @@ def main() -> None:
         normalize_subscripts=not args.no_normalize_subscripts,
     )
     align_cfg = AlignConfig()
+    quality_cfg = QualityConfig(
+        min_quality=args.min_quality,
+        max_gap_ratio=args.max_gap_ratio,
+        max_unk_ratio=args.max_unk_ratio,
+    )
 
     sentence_df = create_sentence_pairs(train_df, sentences_df, align_cfg)
-    processed_df = preprocess_pairs(sentence_df, norm_cfg, align_cfg)
+    processed_df = preprocess_pairs(sentence_df, norm_cfg, align_cfg, quality_cfg)
 
     processed_df.to_csv(out_dir / "sentence_pairs.csv", index=False)
-    processed_df[processed_df["is_valid"]].to_csv(out_dir / "sentence_pairs_valid.csv", index=False)
+    valid_df = processed_df[processed_df["is_valid"] & processed_df["quality_pass"]]
+    valid_df.to_csv(out_dir / "sentence_pairs_valid.csv", index=False)
 
     # Save configs for reproducibility
     with open(out_dir / "preprocess_config.json", "w", encoding="utf-8") as f:
         json.dump({
             "normalize_config": norm_cfg.__dict__,
             "align_config": align_cfg.__dict__,
+            "quality_config": quality_cfg.__dict__,
         }, f, ensure_ascii=True, indent=2)
 
     if args.plot:
-        plot_length_distributions(processed_df[processed_df["is_valid"]], out_dir)
+        plot_length_distributions(valid_df, out_dir)
 
-    valid_count = processed_df["is_valid"].sum()
+    valid_count = len(valid_df)
     print(f"Total pairs: {len(processed_df)}")
     print(f"Valid pairs: {valid_count} ({valid_count/len(processed_df)*100:.1f}%)")
     print(f"Outputs saved to: {out_dir}")
