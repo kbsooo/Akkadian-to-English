@@ -64,6 +64,7 @@ class QualityConfig:
     unk_weight: float = 0.2
     number_penalty: float = 0.1
     annotated_bonus: float = 0.05
+    tier2_min_quality: float = 0.7
 
 
 #%%
@@ -524,6 +525,9 @@ def preprocess_pairs(
     df["quality_pass"] = df["quality_score"] >= quality_cfg.min_quality
     df["quality_pass"] &= df["gap_ratio"] <= quality_cfg.max_gap_ratio
     df["quality_pass"] &= df["unk_ratio"] <= quality_cfg.max_unk_ratio
+    df["pattern_pass"] = df.apply(
+        lambda r: pattern_filter_pass(r["src_norm"], r["tgt_norm"]), axis=1
+    )
 
     return df
 
@@ -575,6 +579,21 @@ def score_pair(
         score += quality_cfg.annotated_bonus
 
     return max(0.0, min(1.0, score))
+
+
+def pattern_filter_pass(src: str, tgt: str) -> bool:
+    # Filter obvious misalignments around formulaic openings.
+    src_tokens = src.split()
+    norm_tokens = {_normalize_token_for_match(t) for t in src_tokens}
+    has_umma = "umma" in norm_tokens
+    has_qibima = "qibima" in norm_tokens
+
+    if not (has_umma or has_qibima):
+        return True
+
+    tgt_low = tgt.lower()
+    cue = re.search(r"\b(from|say|said|says|tell|told|message|thus)\b", tgt_low)
+    return cue is not None
 
 
 #%%
@@ -629,6 +648,7 @@ def build_argparser() -> argparse.ArgumentParser:
     p.add_argument("--min-quality", type=float, default=0.0)
     p.add_argument("--max-gap-ratio", type=float, default=0.5)
     p.add_argument("--max-unk-ratio", type=float, default=0.3)
+    p.add_argument("--tier2-min-quality", type=float, default=0.7)
     return p
 
 
@@ -657,14 +677,22 @@ def main() -> None:
         min_quality=args.min_quality,
         max_gap_ratio=args.max_gap_ratio,
         max_unk_ratio=args.max_unk_ratio,
+        tier2_min_quality=args.tier2_min_quality,
     )
 
     sentence_df = create_sentence_pairs(train_df, sentences_df, align_cfg)
     processed_df = preprocess_pairs(sentence_df, norm_cfg, align_cfg, quality_cfg)
 
     processed_df.to_csv(out_dir / "sentence_pairs.csv", index=False)
-    valid_df = processed_df[processed_df["is_valid"] & processed_df["quality_pass"]]
-    valid_df.to_csv(out_dir / "sentence_pairs_valid.csv", index=False)
+
+    tier1 = processed_df[processed_df["is_valid"] & processed_df["quality_pass"]]
+    tier1.to_csv(out_dir / "sentence_pairs_valid.csv", index=False)
+
+    tier2 = tier1[tier1["quality_score"] >= quality_cfg.tier2_min_quality]
+    tier2.to_csv(out_dir / "sentence_pairs_q70.csv", index=False)
+
+    tier3 = tier2[tier2["pattern_pass"]]
+    tier3.to_csv(out_dir / "sentence_pairs_q70_pattern.csv", index=False)
 
     # Save configs for reproducibility
     with open(out_dir / "preprocess_config.json", "w", encoding="utf-8") as f:
@@ -675,11 +703,13 @@ def main() -> None:
         }, f, ensure_ascii=True, indent=2)
 
     if args.plot:
-        plot_length_distributions(valid_df, out_dir)
+        plot_length_distributions(tier1, out_dir)
 
-    valid_count = len(valid_df)
+    valid_count = len(tier1)
     print(f"Total pairs: {len(processed_df)}")
     print(f"Valid pairs: {valid_count} ({valid_count/len(processed_df)*100:.1f}%)")
+    print(f"Tier2 (q>= {quality_cfg.tier2_min_quality}): {len(tier2)}")
+    print(f"Tier3 (q>= {quality_cfg.tier2_min_quality} + pattern): {len(tier3)}")
     print(f"Outputs saved to: {out_dir}")
 
 
