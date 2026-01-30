@@ -1,5 +1,8 @@
-data/
 .DS_Store
 .venv/
 src/outputs/
 __pycache__/
+
+data/
+logs/
+models/
