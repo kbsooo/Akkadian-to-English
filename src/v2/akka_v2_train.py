@@ -114,7 +114,7 @@ if torch.cuda.is_available():
 
 #%%
 print("📖 Loading preprocessed data...")
-train_df = pd.read_csv(DATA_DIR / "v2_train.csv")
+train_df = pd.read_csv(DATA_DIR / "v2_train_augmented.csv")  # Use augmented data
 val_df = pd.read_csv(DATA_DIR / "v2_val.csv")
 
 print(f"   Train: {len(train_df)}, Val: {len(val_df)}")
