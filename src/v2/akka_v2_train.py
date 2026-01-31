@@ -1,16 +1,31 @@
 #%% [markdown]
-# # Akkadian V2 Training
+# # Akkadian V2 Training (Colab Version)
 #
 # **Key Changes from V1:**
 # - Unified ASCII normalization (Train/Test style mismatch fixed)
 # - All diacritics converted to ASCII (š→s, à→a, etc.)
 #
-# **Environment**: Kaggle T4 GPU x2
+# **Environment**: Google Colab with GPU
 #
-# **Usage:**
-# ```bash
-# uv run jupytext --to notebook src/v2/akka_v2_train.py
-# ```
+# **Output**: Saved to Google Drive `/content/drive/MyDrive/akkadian/v2`
+
+#%% [markdown]
+# ## 0. Setup: Kaggle Data Download
+
+#%%
+# Mount Google Drive
+from google.colab import drive
+drive.mount('/content/drive')
+
+#%%
+# Kaggle Hub login and data download
+import kagglehub
+kagglehub.login()
+
+#%%
+# Download data from Kaggle
+kbsooo_akkadian_v2_data_path = kagglehub.dataset_download('kbsooo/akkadian-v2-data')
+print(f'Data downloaded to: {kbsooo_akkadian_v2_data_path}')
 
 #%% [markdown]
 # ## 1. Imports & Configuration
@@ -40,21 +55,21 @@ from transformers import (
 #%%
 @dataclass
 class Config:
-    """Training configuration for Kaggle T4 x2."""
+    """Training configuration for Colab GPU."""
     # Model
     model_name: str = "google/byt5-base"
     
-    # Paths
-    kaggle_input: Path = Path("/kaggle/input")
-    kaggle_working: Path = Path("/kaggle/working")
+    # Paths (Colab + Google Drive)
+    data_dir: Path = None  # Set after kagglehub download
+    output_dir: Path = Path("/content/drive/MyDrive/akkadian/v2")
     
     # Training
     seed: int = 42
-    max_source_length: int = 512   # Increased for longer documents
+    max_source_length: int = 512
     max_target_length: int = 512
-    batch_size: int = 2            # Per GPU
+    batch_size: int = 2
     gradient_accumulation_steps: int = 8
-    epochs: int = 10               # More epochs
+    epochs: int = 10
     learning_rate: float = 3e-4
     warmup_ratio: float = 0.05
     weight_decay: float = 0.01
@@ -68,54 +83,25 @@ class Config:
 
 CFG = Config()
 
-#%% [markdown]
-# ## 2. Environment Detection
+# Set data directory from kagglehub download
+CFG.data_dir = Path(kbsooo_akkadian_v2_data_path)
 
-#%%
-def is_kaggle() -> bool:
-    return Path("/kaggle/input").exists()
+# Ensure output directory exists
+CFG.output_dir.mkdir(parents=True, exist_ok=True)
 
-
-def find_data_dir() -> Path:
-    """Find V2 preprocessed data."""
-    if is_kaggle():
-        # On Kaggle: look for v2_train.csv in input datasets
-        for d in CFG.kaggle_input.iterdir():
-            if (d / "v2_train.csv").exists():
-                return d
-        # Fallback: run preprocessing
-        raise FileNotFoundError("V2 data not found. Upload v2_train.csv and v2_val.csv as a dataset.")
-    else:
-        # Local
-        local = Path("data/v2")
-        if local.exists():
-            return local
-        raise FileNotFoundError("Run build_dataset.py first")
-
-
-def get_output_dir() -> Path:
-    if is_kaggle():
-        return CFG.kaggle_working / "akkadian_v2"
-    return Path("outputs/akkadian_v2")
-
-
-DATA_DIR = find_data_dir()
-OUTPUT_DIR = get_output_dir()
-
-print(f"📁 Data directory: {DATA_DIR}")
-print(f"📁 Output directory: {OUTPUT_DIR}")
-print(f"🖥️ Kaggle: {is_kaggle()}")
+print(f"📁 Data directory: {CFG.data_dir}")
+print(f"📁 Output directory: {CFG.output_dir}")
 print(f"🎮 CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
-    print(f"   GPUs: {torch.cuda.device_count()}")
+    print(f"   GPU: {torch.cuda.get_device_name(0)}")
 
 #%% [markdown]
-# ## 3. Load Data
+# ## 2. Load Data
 
 #%%
 print("📖 Loading preprocessed data...")
-train_df = pd.read_csv(DATA_DIR / "v2_train_augmented.csv")  # Use augmented data
-val_df = pd.read_csv(DATA_DIR / "v2_val.csv")
+train_df = pd.read_csv(CFG.data_dir / "v2_train_augmented.csv")
+val_df = pd.read_csv(CFG.data_dir / "v2_val.csv")
 
 print(f"   Train: {len(train_df)}, Val: {len(val_df)}")
 print(f"\n📝 Sample:")
@@ -123,7 +109,7 @@ print(f"   src: {train_df.iloc[0]['src'][:80]}...")
 print(f"   tgt: {train_df.iloc[0]['tgt'][:80]}...")
 
 #%% [markdown]
-# ## 4. Tokenization
+# ## 3. Tokenization
 
 #%%
 print(f"🤖 Loading model: {CFG.model_name}")
@@ -162,7 +148,7 @@ val_ds = val_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"], de
 print(f"   Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
 
 #%% [markdown]
-# ## 5. Metrics
+# ## 4. Metrics
 
 #%%
 def build_compute_metrics(tokenizer):
@@ -192,13 +178,38 @@ def build_compute_metrics(tokenizer):
     return compute_metrics
 
 #%% [markdown]
-# ## 6. Training
+# ## 5. Training
+
+#%%
+from transformers import TrainerCallback
+
+class LoggingCallback(TrainerCallback):
+    """Custom callback for cleaner training logs."""
+    
+    def on_epoch_end(self, args, state, control, **kwargs):
+        if state.log_history:
+            last_log = state.log_history[-1]
+            epoch = last_log.get('epoch', 0)
+            train_loss = last_log.get('loss', 'N/A')
+            print(f"\n{'='*50}")
+            print(f"📊 Epoch {int(epoch)} Complete")
+            print(f"   Train Loss: {train_loss:.4f}" if isinstance(train_loss, float) else f"   Train Loss: {train_loss}")
+    
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics:
+            print(f"\n📈 Validation Results:")
+            print(f"   Loss: {metrics.get('eval_loss', 'N/A'):.4f}" if metrics.get('eval_loss') else "   Loss: N/A")
+            print(f"   BLEU: {metrics.get('eval_bleu', 0):.2f}")
+            print(f"   chrF++: {metrics.get('eval_chrf', 0):.2f}")
+            print(f"   Geo Mean: {metrics.get('eval_geo_mean', 0):.2f}")
+            print(f"{'='*50}")
+
 
 #%%
 data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
 
 training_args = Seq2SeqTrainingArguments(
-    output_dir=str(OUTPUT_DIR),
+    output_dir=str(CFG.output_dir / "checkpoints"),
     num_train_epochs=CFG.epochs,
     per_device_train_batch_size=CFG.batch_size,
     per_device_eval_batch_size=CFG.batch_size * 2,
@@ -217,10 +228,11 @@ training_args = Seq2SeqTrainingArguments(
     predict_with_generate=True,
     generation_max_length=CFG.max_target_length,
     dataloader_num_workers=CFG.dataloader_num_workers,
-    logging_steps=50,
+    logging_steps=100,  # Less frequent logging
+    logging_first_step=True,
     report_to="none",
     seed=CFG.seed,
-    ddp_find_unused_parameters=False,
+    disable_tqdm=False,  # Keep progress bar
 )
 
 trainer = Seq2SeqTrainer(
@@ -231,6 +243,7 @@ trainer = Seq2SeqTrainer(
     tokenizer=tokenizer,
     data_collator=data_collator,
     compute_metrics=build_compute_metrics(tokenizer),
+    callbacks=[LoggingCallback()],
 )
 
 #%%
@@ -238,9 +251,9 @@ print("\n🏋️ Training...")
 trainer.train()
 
 #%%
-# Save final model
-final_dir = OUTPUT_DIR / "final"
-print(f"\n💾 Saving to {final_dir}")
+# Save final model to Google Drive
+final_dir = CFG.output_dir / "final"
+print(f"\n💾 Saving to Google Drive: {final_dir}")
 trainer.save_model(str(final_dir))
 tokenizer.save_pretrained(str(final_dir))
 
@@ -252,16 +265,14 @@ print(f"   chrF++: {results.get('eval_chrf', 0):.2f}")
 print(f"   Geo Mean: {results.get('eval_geo_mean', 0):.2f}")
 
 print("\n✅ Training complete!")
+print(f"📁 Model saved to: {final_dir}")
 
 #%% [markdown]
-# ## 7. Create Model Archive
-#
-# For Kaggle Models upload:
+# ## 6. Create Model Archive (Optional)
 
 #%%
 import shutil
 
-if is_kaggle():
-    zip_path = CFG.kaggle_working / "akkadian_v2_model"
-    shutil.make_archive(str(zip_path), 'zip', final_dir)
-    print(f"📦 Model archived: {zip_path}.zip")
+zip_path = CFG.output_dir / "akkadian_v2_model"
+shutil.make_archive(str(zip_path), 'zip', final_dir)
+print(f"📦 Model archived: {zip_path}.zip")

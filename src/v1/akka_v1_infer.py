@@ -202,18 +202,23 @@ from transformers import ByT5Tokenizer
 
 print(f"🤖 Loading model from {MODEL_DIR}")
 
-# Load tokenizer with fallback for version compatibility
-# ByT5 uses byte-level tokenization, so we can use ByT5Tokenizer directly
-try:
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    print("   ✅ Tokenizer loaded from model directory")
-except Exception as e:
-    print(f"   ⚠️ AutoTokenizer failed: {e}")
-    print("   ℹ️ Using ByT5Tokenizer() directly (byte-level, no vocab needed)")
-    tokenizer = ByT5Tokenizer()
-
 # Load model
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_DIR)
+
+# Force ByT5Tokenizer and compute extra_ids from model config.
+# ByT5 vocab = 256 bytes + 3 specials + extra_ids => extra_ids = vocab_size - 259
+vocab_size = getattr(model.config, "vocab_size", None)
+extra_ids = 125
+if isinstance(vocab_size, int):
+    extra_ids = max(vocab_size - 259, 0)
+tokenizer = ByT5Tokenizer(extra_ids=extra_ids)
+print(f"   ✅ Using ByT5Tokenizer(extra_ids={extra_ids})")
+
+# Sanity check for potential mismatch
+if isinstance(vocab_size, int) and tokenizer.vocab_size != vocab_size:
+    print(
+        f"   ⚠️ Tokenizer vocab_size ({tokenizer.vocab_size}) != model vocab_size ({vocab_size})"
+    )
 
 # Move to device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
