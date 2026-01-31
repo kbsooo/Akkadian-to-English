@@ -142,13 +142,13 @@ def tokenize_fn(examples):
         truncation=True,
         padding=False,
     )
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(
-            examples["tgt"],
-            max_length=CFG.max_target_length,
-            truncation=True,
-            padding=False,
-        )
+    # ByT5: encoder/decoder share same vocab, no as_target_tokenizer() needed
+    labels = tokenizer(
+        examples["tgt"],
+        max_length=CFG.max_target_length,
+        truncation=True,
+        padding=False,
+    )
     model_inputs["labels"] = labels["input_ids"]
     return model_inputs
 
