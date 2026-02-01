@@ -62,20 +62,27 @@ class Config:
     # Paths (Colab + Google Drive)
     data_dir: Path = None  # Set after kagglehub download
     output_dir: Path = Path("/content/drive/MyDrive/akkadian/v2")
+
+    # Data selection
+    data_variant: str = "sentence"  # "sentence" (recommended) or "document"
+    sentence_train_file: str = "v2_sentence_train.csv"
+    sentence_val_file: str = "v2_sentence_val.csv"
+    doc_train_file: str = "v2_train_augmented_clean.csv"
+    doc_val_file: str = "v2_val.csv"
     
     # Training
     seed: int = 42
-    max_source_length: int = 512
-    max_target_length: int = 512
-    batch_size: int = 2
-    gradient_accumulation_steps: int = 8
+    max_source_length: int = 256   # Reduced from 512 to prevent overflow
+    max_target_length: int = 256   # Reduced from 512
+    batch_size: int = 4            # Increased from 2
+    gradient_accumulation_steps: int = 4  # Reduced from 8
     epochs: int = 10
-    learning_rate: float = 3e-4
-    warmup_ratio: float = 0.05
+    learning_rate: float = 1e-4    # Reduced from 3e-4
+    warmup_ratio: float = 0.1      # Increased from 0.05
     weight_decay: float = 0.01
     
-    # Hardware
-    fp16: bool = True
+    # Hardware - FP16 DISABLED to prevent ByT5 overflow!
+    fp16: bool = False             # Changed from True - ByT5 is unstable with FP16
     bf16: bool = False
     gradient_checkpointing: bool = True
     dataloader_num_workers: int = 2
@@ -95,18 +102,49 @@ print(f"🎮 CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"   GPU: {torch.cuda.get_device_name(0)}")
 
+# Reproducibility
+set_seed(CFG.seed)
+
 #%% [markdown]
 # ## 2. Load Data
 
 #%%
+def resolve_data_paths() -> tuple[Path, Path]:
+    """Choose sentence-level data if available; fall back to document-level."""
+    if CFG.data_variant == "sentence":
+        train_path = CFG.data_dir / CFG.sentence_train_file
+        val_path = CFG.data_dir / CFG.sentence_val_file
+        if train_path.exists() and val_path.exists():
+            return train_path, val_path
+        print("⚠️ Sentence-level files not found. Falling back to document-level.")
+    return CFG.data_dir / CFG.doc_train_file, CFG.data_dir / CFG.doc_val_file
+
+
 print("📖 Loading preprocessed data...")
-train_df = pd.read_csv(CFG.data_dir / "v2_train_augmented.csv")
-val_df = pd.read_csv(CFG.data_dir / "v2_val.csv")
+train_path, val_path = resolve_data_paths()
+train_df = pd.read_csv(train_path)
+val_df = pd.read_csv(val_path)
+
+required_cols = {"src", "tgt"}
+if not required_cols.issubset(train_df.columns):
+    missing = required_cols - set(train_df.columns)
+    raise ValueError(f"Missing columns in train data: {missing}")
+if not required_cols.issubset(val_df.columns):
+    missing = required_cols - set(val_df.columns)
+    raise ValueError(f"Missing columns in val data: {missing}")
+
+train_df = train_df.dropna(subset=["src", "tgt"]).reset_index(drop=True)
+val_df = val_df.dropna(subset=["src", "tgt"]).reset_index(drop=True)
 
 print(f"   Train: {len(train_df)}, Val: {len(val_df)}")
 print(f"\n📝 Sample:")
 print(f"   src: {train_df.iloc[0]['src'][:80]}...")
 print(f"   tgt: {train_df.iloc[0]['tgt'][:80]}...")
+
+# Truncation risk check
+src_over = (train_df["src"].str.len() > CFG.max_source_length).mean()
+tgt_over = (train_df["tgt"].str.len() > CFG.max_target_length).mean()
+print(f"\n⚠️ Truncation risk (train): src>{CFG.max_source_length}: {src_over:.1%}, tgt>{CFG.max_target_length}: {tgt_over:.1%}")
 
 #%% [markdown]
 # ## 3. Tokenization
@@ -208,7 +246,7 @@ class LoggingCallback(TrainerCallback):
 #%%
 data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
 
-training_args = Seq2SeqTrainingArguments(
+training_kwargs = dict(
     output_dir=str(CFG.output_dir / "checkpoints"),
     num_train_epochs=CFG.epochs,
     per_device_train_batch_size=CFG.batch_size,
@@ -219,7 +257,7 @@ training_args = Seq2SeqTrainingArguments(
     warmup_ratio=CFG.warmup_ratio,
     fp16=CFG.fp16 and torch.cuda.is_available(),
     bf16=CFG.bf16,
-    eval_strategy="epoch",
+    evaluation_strategy="epoch",
     save_strategy="epoch",
     save_total_limit=2,
     load_best_model_at_end=True,
@@ -233,7 +271,14 @@ training_args = Seq2SeqTrainingArguments(
     report_to="none",
     seed=CFG.seed,
     disable_tqdm=False,  # Keep progress bar
+    max_grad_norm=1.0,
 )
+
+try:
+    training_args = Seq2SeqTrainingArguments(**training_kwargs)
+except TypeError:
+    training_kwargs["eval_strategy"] = training_kwargs.pop("evaluation_strategy")
+    training_args = Seq2SeqTrainingArguments(**training_kwargs)
 
 trainer = Seq2SeqTrainer(
     model=model,
