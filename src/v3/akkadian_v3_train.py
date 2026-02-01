@@ -77,11 +77,11 @@ class Config:
     train_file: str = "v2_sentence_train.csv"
     val_file: str = "v2_sentence_val.csv"
     
-    # LoRA Configuration (from V3 strategy doc)
-    lora_r: int = 8
-    lora_alpha: int = 16
+    # LoRA Configuration (expanded for better performance)
+    lora_r: int = 16
+    lora_alpha: int = 32
     lora_dropout: float = 0.05
-    lora_target_modules: List[str] = field(default_factory=lambda: ["q", "v"])
+    lora_target_modules: List[str] = field(default_factory=lambda: ["q", "k", "v", "o"])
     
     # Training
     seed: int = 42
@@ -89,8 +89,8 @@ class Config:
     max_target_length: int = 256
     batch_size: int = 4  # A100 can handle more
     gradient_accumulation_steps: int = 4
-    epochs: int = 10
-    learning_rate: float = 1e-4
+    epochs: int = 20  # Extended for LoRA convergence
+    learning_rate: float = 2e-4  # Higher LR for LoRA
     warmup_ratio: float = 0.1
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
