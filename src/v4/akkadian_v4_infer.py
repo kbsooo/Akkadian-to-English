@@ -4,7 +4,8 @@
 # **Key Features:**
 # - V4 model (Full FT + OCR-augmented training)
 # - V2-identical normalization (NO augmentation at inference)
-# - Works on Kaggle Internet OFF
+# - ByT5Tokenizer for consistency
+# - NO repetition_penalty (avoid BLEU degradation)
 #
 # **Environment**: Kaggle T4/P100 GPU
 #
@@ -21,13 +22,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, ByT5Tokenizer
 
 #%%
 @dataclass
@@ -40,18 +41,15 @@ class Config:
     model_size: str = "base"  # Change to "large" for v4-large
     
     # Model path (set in __post_init__)
-    model_path: Path = None
+    model_path: Path = field(init=False)
     
     # Inference params (same as V2)
     max_source_length: int = 512
     max_target_length: int = 512
     batch_size: int = 4
     num_beams: int = 4
-    fp16: bool = False  # ByT5 is unstable with FP16
     
     def __post_init__(self):
-        # Find model path based on model_size
-        # You may need to adjust these paths based on your Kaggle dataset
         if self.model_size == "base":
             self.model_path = self.kaggle_input / "akkadian-v4-base/pytorch/default/1"
         else:
@@ -94,7 +92,7 @@ def find_model():
             return local
         raise FileNotFoundError("Local model not found")
     
-    # Check configured path first
+    # Check configured path
     if CFG.model_path.exists():
         return CFG.model_path
     
@@ -109,13 +107,9 @@ def find_model():
     raise FileNotFoundError(f"V4-{CFG.model_size} model not found")
 
 #%% [markdown]
-# ## 3. Normalization (V2-identical, NO augmentation)
+# ## 3. Normalization (V2-identical)
 
 #%%
-# ==============================================================================
-# Character Mapping Tables (copied from V2 normalize.py)
-# ==============================================================================
-
 _VOWEL_MAP = {
     '\u00e0': 'a', '\u00e1': 'a', '\u00e2': 'a', '\u0101': 'a', '\u00e4': 'a',
     '\u00c0': 'A', '\u00c1': 'A', '\u00c2': 'A', '\u0100': 'A', '\u00c4': 'A',
@@ -137,18 +131,10 @@ _CONSONANT_MAP = {
 }
 
 _OCR_MAP = {
-    '\u201e': '"',
-    '\u201c': '"',
-    '\u201d': '"',
-    '\u2018': "'",
-    '\u2019': "'",
-    '\u201a': "'",
-    '\u02be': "'",
-    '\u02bf': "'",
-    '\u2308': '[',
-    '\u2309': ']',
-    '\u230a': '[',
-    '\u230b': ']',
+    '\u201e': '"', '\u201c': '"', '\u201d': '"',
+    '\u2018': "'", '\u2019': "'", '\u201a': "'",
+    '\u02be': "'", '\u02bf': "'",
+    '\u2308': '[', '\u2309': ']', '\u230a': '[', '\u230b': ']',
 }
 
 _SUBSCRIPT_MAP = str.maketrans({
@@ -161,14 +147,9 @@ _FULL_MAP = str.maketrans({**_VOWEL_MAP, **_CONSONANT_MAP, **_OCR_MAP})
 
 
 def normalize_transliteration(text) -> str:
-    """
-    Normalize Akkadian transliteration to ASCII-compatible format.
-    
-    IDENTICAL to V2 normalize.py - NO augmentation at inference.
-    """
+    """Normalize Akkadian transliteration to ASCII (V2-identical)."""
     if text is None or (isinstance(text, float) and text != text):
         return ""
-    
     text = str(text)
     text = unicodedata.normalize("NFC", text)
     text = text.translate(_FULL_MAP)
@@ -179,7 +160,6 @@ def normalize_transliteration(text) -> str:
     text = re.sub(r'\bx\b', ' <unk> ', text, flags=re.IGNORECASE)
     text = re.sub(r'[!?/]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
-    
     return text
 
 #%% [markdown]
@@ -207,11 +187,19 @@ print("=" * 60)
 print(f"\n🤖 Loading model from: {MODEL_DIR}")
 print("   This may take a few minutes...")
 
-tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR))
+# Use ByT5Tokenizer for consistency (same as training)
+# ByT5 vocab: 256 (bytes) + 3 (special) + 125 (extra_ids) = 384
+tokenizer = ByT5Tokenizer(extra_ids=125)
 print(f"   Tokenizer vocab size: {len(tokenizer)}")
 
 model = AutoModelForSeq2SeqLM.from_pretrained(str(MODEL_DIR))
+print(f"   Model vocab size: {model.config.vocab_size}")
 print(f"   Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+# Verify vocab match
+assert len(tokenizer) == model.config.vocab_size, \
+    f"Vocab mismatch! Tokenizer: {len(tokenizer)}, Model: {model.config.vocab_size}"
+print("   ✅ Vocab sizes match")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
@@ -237,12 +225,11 @@ def generate_batch(texts, debug=False):
     if debug:
         print(f"   [DEBUG] Input shape: {inputs['input_ids'].shape}")
     
+    # NOTE: NO repetition_penalty (can hurt BLEU on short sequences)
     outputs = model.generate(
         **inputs,
         max_length=CFG.max_target_length,
         num_beams=CFG.num_beams,
-        repetition_penalty=1.2,
-        no_repeat_ngram_size=3,
         early_stopping=True,
     )
     
@@ -282,7 +269,7 @@ print("\n📖 Loading test data...")
 test_df = pd.read_csv(COMP_DIR / "test.csv")
 print(f"   Test samples: {len(test_df):,}")
 
-print("\n🔧 Normalizing (V2-identical, NO augmentation)...")
+print("\n🔧 Normalizing (V2-identical)...")
 normalized = [normalize_transliteration(t) for t in tqdm(test_df["transliteration"], desc="Normalizing")]
 
 print(f"\n📝 Sample normalized:")
@@ -298,6 +285,11 @@ print(f"[DEBUG] First translation: '{test_result[0][:100]}...'")
 
 translations = translate_all(normalized)
 
+# Validate outputs
+empty_count = sum(1 for t in translations if not t or not t.strip())
+if empty_count > 0:
+    print(f"\n⚠️ WARNING: {empty_count} empty translations!")
+
 print(f"\n📝 Sample outputs:")
 for i in range(min(3, len(translations))):
     print(f"   [{i}] {translations[i][:150]}...")
@@ -306,10 +298,17 @@ for i in range(min(3, len(translations))):
 # ## 8. Create Submission
 
 #%%
+# Ensure no empty translations (replace with placeholder if needed)
+translations = [t if t and t.strip() else "[Translation unavailable]" for t in translations]
+
 submission = pd.DataFrame({
     "id": test_df["id"],
     "translation": translations,
 })
+
+# Validate
+assert len(submission) == len(test_df), "Submission length mismatch!"
+assert submission["translation"].notna().all(), "Submission has NaN values!"
 
 output_path = CFG.kaggle_working / "submission.csv" if is_kaggle() else Path("submission.csv")
 submission.to_csv(output_path, index=False)
