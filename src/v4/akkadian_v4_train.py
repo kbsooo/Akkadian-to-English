@@ -26,7 +26,7 @@ kagglehub.login()
 
 #%%
 # Download competition data
-competition_path = kagglehub.dataset_download('deep-past-initiative-machine-translation')
+competition_path = kagglehub.competition_download('deep-past-initiative-machine-translation')
 print(f'Competition data: {competition_path}')
 
 #%% [markdown]
