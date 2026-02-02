@@ -14,6 +14,16 @@
 # ```
 
 #%% [markdown]
+# ## 0. Setup: Upgrade PEFT (CRITICAL!)
+# 
+# LoRA adapter was trained with a newer PEFT version.
+# Must upgrade to match training environment.
+
+#%%
+# Upgrade PEFT to match training environment
+!pip install -q -U peft
+
+#%% [markdown]
 # ## 1. Imports & Configuration
 
 #%%
