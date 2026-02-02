@@ -73,7 +73,7 @@ class Config:
     
     # OCR Augmentation - applied BEFORE normalization
     augment_prob: float = 0.4
-    use_published_texts: bool = True
+    use_published_texts: bool = False  # Reserved for DAPT phase
     
     # Training
     seed: int = 42
