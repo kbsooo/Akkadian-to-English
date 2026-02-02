@@ -298,8 +298,12 @@ for i in range(min(3, len(translations))):
 # ## 8. Create Submission
 
 #%%
-# Ensure no empty translations (replace with placeholder if needed)
-translations = [t if t and t.strip() else "[Translation unavailable]" for t in translations]
+# Check for empty translations
+empty_count = sum(1 for t in translations if not t or not t.strip())
+if empty_count > 0:
+    print(f"\n⚠️ WARNING: {empty_count}/{len(translations)} empty translations!")
+    print("   This may indicate model issues. Please verify.")
+    # Keep empty as is for now - replacing hurts BLEU more
 
 submission = pd.DataFrame({
     "id": test_df["id"],
