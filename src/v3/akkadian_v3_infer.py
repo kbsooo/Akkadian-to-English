@@ -4,7 +4,7 @@
 # **Key Features:**
 # - Pre-merged model (LoRA already integrated into base model)
 # - NO PEFT required → Works on Kaggle Internet OFF
-# - Same normalization as training
+# - **V2-identical normalization** for consistent results
 #
 # **Environment**: Kaggle T4/P100 GPU (Internet OFF supported)
 #
@@ -27,7 +27,7 @@ from pathlib import Path
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, ByT5Tokenizer
 
 #%%
 @dataclass
@@ -39,9 +39,9 @@ class Config:
     # Model path (merged model - no PEFT needed)
     model_path: str = "/kaggle/input/akkadian-v3/pytorch/default/4"
     
-    # Inference params
-    max_source_length: int = 256
-    max_target_length: int = 256
+    # Inference params (MUST match V2 for fair comparison)
+    max_source_length: int = 512   # Same as V2
+    max_target_length: int = 512   # Same as V2
     batch_size: int = 4
     num_beams: int = 4
     fp16: bool = False  # ByT5 is unstable with FP16
@@ -72,75 +72,111 @@ def find_competition_data():
     raise FileNotFoundError("Competition data not found")
 
 #%% [markdown]
-# ## 3. Normalization (must match training)
+# ## 3. Normalization (IDENTICAL to V2 normalize.py)
 
 #%%
-# ASCII transliteration mapping
-_NORMALIZE_MAP = {
-    # Shin/Sibilants
-    'š': 's', 'Š': 'S',
-    'ṣ': 's', 'Ṣ': 'S',
-    'ś': 's', 'Ś': 'S',
-    
-    # Emphatics
-    'ṭ': 't', 'Ṭ': 'T',
-    'ḫ': 'h', 'Ḫ': 'H',
-    'ḥ': 'h', 'Ḥ': 'H',
-    
-    # Ayin, Aleph
-    'ʾ': "'", 'ʿ': "'", ''': "'", ''': "'",
-    'ˀ': "'", 'ˁ': "'",
-    'ʔ': "'", 'ʕ': "'",
-    
-    # Nasals
-    'ṃ': 'm', 'Ṃ': 'M',
-    'ṅ': 'n', 'Ṅ': 'N',
-    'ñ': 'n', 'Ñ': 'N',
-    
-    # Long vowels (macron)
-    'ā': 'a', 'Ā': 'A',
-    'ē': 'e', 'Ē': 'E',
-    'ī': 'i', 'Ī': 'I',
-    'ō': 'o', 'Ō': 'O',
-    'ū': 'u', 'Ū': 'U',
-    
-    # Breve
-    'ă': 'a', 'ĕ': 'e', 'ĭ': 'i', 'ŏ': 'o', 'ŭ': 'u',
-    
-    # Subscript numbers → normal
-    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
-    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
-    
-    # Superscript
-    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
-    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
-    
-    # Special
-    '×': 'x', '·': '.', '°': '',
+# ==============================================================================
+# Character Mapping Tables (copied from V2 normalize.py)
+# ==============================================================================
+
+# Vowels with diacritics → base vowels
+_VOWEL_MAP = {
+    # a variants
+    '\u00e0': 'a', '\u00e1': 'a', '\u00e2': 'a', '\u0101': 'a', '\u00e4': 'a',
+    '\u00c0': 'A', '\u00c1': 'A', '\u00c2': 'A', '\u0100': 'A', '\u00c4': 'A',
+    # e variants
+    '\u00e8': 'e', '\u00e9': 'e', '\u00ea': 'e', '\u0113': 'e', '\u00eb': 'e',
+    '\u00c8': 'E', '\u00c9': 'E', '\u00ca': 'E', '\u0112': 'E', '\u00cb': 'E',
+    # i variants  
+    '\u00ec': 'i', '\u00ed': 'i', '\u00ee': 'i', '\u012b': 'i', '\u00ef': 'i',
+    '\u00cc': 'I', '\u00cd': 'I', '\u00ce': 'I', '\u012a': 'I', '\u00cf': 'I',
+    # o variants
+    '\u00f2': 'o', '\u00f3': 'o', '\u00f4': 'o', '\u014d': 'o', '\u00f6': 'o',
+    '\u00d2': 'O', '\u00d3': 'O', '\u00d4': 'O', '\u014c': 'O', '\u00d6': 'O',
+    # u variants
+    '\u00f9': 'u', '\u00fa': 'u', '\u00fb': 'u', '\u016b': 'u', '\u00fc': 'u',
+    '\u00d9': 'U', '\u00da': 'U', '\u00db': 'U', '\u016a': 'U', '\u00dc': 'U',
 }
 
+# Special Akkadian consonants → ASCII
+_CONSONANT_MAP = {
+    '\u0161': 's', '\u0160': 'S',  # š, Š (shin)
+    '\u1e63': 's', '\u1e62': 'S',  # ṣ, Ṣ (tsade)
+    '\u1e6d': 't', '\u1e6c': 'T',  # ṭ, Ṭ (emphatic t)
+    '\u1e2b': 'h', '\u1e2a': 'H',  # ḫ, Ḫ (het)
+}
 
-def normalize_transliteration(text: str) -> str:
-    """Convert Akkadian transliteration to ASCII (must match training)."""
-    if not isinstance(text, str):
+# OCR artifacts and typography
+_OCR_MAP = {
+    '\u201e': '"',   # „ German low quote
+    '\u201c': '"',   # " left double quote
+    '\u201d': '"',   # " right double quote
+    '\u2018': "'",   # ' left single quote
+    '\u2019': "'",   # ' right single quote
+    '\u201a': "'",   # ‚ single low quote
+    '\u02be': "'",   # ʾ aleph (modifier letter right half ring)
+    '\u02bf': "'",   # ʿ ayin (modifier letter left half ring)
+    '\u2308': '[',   # ⌈ left ceiling (half bracket)
+    '\u2309': ']',   # ⌉ right ceiling
+    '\u230a': '[',   # ⌊ left floor
+    '\u230b': ']',   # ⌋ right floor
+}
+
+# Subscripts → numbers
+_SUBSCRIPT_MAP = str.maketrans({
+    '\u2080': '0', '\u2081': '1', '\u2082': '2', '\u2083': '3', '\u2084': '4',
+    '\u2085': '5', '\u2086': '6', '\u2087': '7', '\u2088': '8', '\u2089': '9',
+    '\u2093': 'x',
+})
+
+# Combined translation table
+_FULL_MAP = str.maketrans({**_VOWEL_MAP, **_CONSONANT_MAP, **_OCR_MAP})
+
+
+def normalize_transliteration(text) -> str:
+    """
+    Normalize Akkadian transliteration to ASCII-compatible format.
+    
+    IDENTICAL to V2 src/v2/normalize.py:normalize_transliteration
+    
+    Transformations:
+    1. Unicode NFC normalization
+    2. Diacritics removal (à → a, š → s, etc.)
+    3. OCR artifact cleanup (curly quotes → straight quotes)
+    4. Subscript normalization (₄ → 4)
+    5. Gap/damage markers ([...] → <gap>)
+    6. Unknown sign markers (x → <unk>)
+    7. Editorial mark removal (!?/)
+    8. Whitespace normalization
+    """
+    if text is None or (isinstance(text, float) and text != text):  # NaN check
         return ""
     
-    # NFD decomposition
-    text = unicodedata.normalize('NFD', text)
+    text = str(text)
     
-    # Apply mapping
-    result = []
-    for char in text:
-        if char in _NORMALIZE_MAP:
-            result.append(_NORMALIZE_MAP[char])
-        elif unicodedata.category(char) == 'Mn':  # Skip combining marks
-            continue
-        else:
-            result.append(char)
+    # 1. Unicode normalization
+    text = unicodedata.normalize("NFC", text)
     
-    text = ''.join(result)
+    # 2. Apply character mappings (diacritics, consonants, OCR)
+    text = text.translate(_FULL_MAP)
     
-    # Whitespace cleanup
+    # 3. Subscript normalization
+    text = text.translate(_SUBSCRIPT_MAP)
+    
+    # 4. Handle ellipsis and big gaps
+    text = text.replace('\u2026', ' <gap> ')  # …
+    text = re.sub(r'\.\.\.+', ' <gap> ', text)
+    
+    # 5. Handle bracketed content (damaged/reconstructed)
+    text = re.sub(r'\[([^\]]*)\]', ' <gap> ', text)
+    
+    # 6. Handle unknown signs
+    text = re.sub(r'\bx\b', ' <unk> ', text, flags=re.IGNORECASE)
+    
+    # 7. Remove editorial marks
+    text = re.sub(r'[!?/]', ' ', text)
+    
+    # 8. Normalize whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
@@ -151,6 +187,7 @@ def normalize_transliteration(text: str) -> str:
 #%%
 print("=" * 60)
 print("🚀 Akkadian V3 Inference: Merged Model (PEFT-free)")
+print("   Normalization: V2-identical")
 print("=" * 60)
 
 COMP_DIR = find_competition_data()
@@ -170,12 +207,21 @@ print("=" * 60)
 print(f"\n🤖 Loading merged model from: {MODEL_DIR}")
 print("   This may take a few minutes...")
 
-# Load tokenizer and model directly (no PEFT needed!)
-tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR))
+# Use ByT5Tokenizer with extra_ids to match V2 exactly
+# ByT5 vocab: 256 (bytes) + 3 (special) + 125 (extra_ids) = 384
+tokenizer = ByT5Tokenizer(extra_ids=125)
 print(f"   Tokenizer vocab size: {len(tokenizer)}")
 
 model = AutoModelForSeq2SeqLM.from_pretrained(str(MODEL_DIR))
+print(f"   Model vocab size: {model.config.vocab_size}")
 print(f"   Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
+
+# Verify vocab sizes match
+if len(tokenizer) != model.config.vocab_size:
+    print(f"   ⚠️ Vocab mismatch! Tokenizer: {len(tokenizer)}, Model: {model.config.vocab_size}")
+    # Do NOT resize - use model's vocab size
+else:
+    print(f"   ✅ Vocab sizes match: {len(tokenizer)}")
 
 # Move to GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -206,6 +252,8 @@ def generate_batch(texts, debug=False):
         **inputs,
         max_length=CFG.max_target_length,
         num_beams=CFG.num_beams,
+        repetition_penalty=1.2,   # Prevent repetition
+        no_repeat_ngram_size=3,   # No 3-gram repeats
         early_stopping=True,
     )
     
@@ -245,8 +293,8 @@ print("\n📖 Loading test data...")
 test_df = pd.read_csv(COMP_DIR / "test.csv")
 print(f"   Test samples: {len(test_df):,}")
 
-# Normalize
-print("\n🔧 Normalizing (ASCII conversion)...")
+# Normalize using V2-identical function
+print("\n🔧 Normalizing (V2-identical)...")
 normalized = [normalize_transliteration(t) for t in tqdm(test_df["transliteration"], desc="Normalizing")]
 
 print(f"\n📝 Sample normalized:")
