@@ -199,8 +199,8 @@ print("=" * 60)
 print(f"\n🤖 Loading base model: {BASE_MODEL_PATH}")
 print("   This may take a few minutes...")
 
-# Load tokenizer from base model path
-tokenizer = ByT5Tokenizer.from_pretrained(BASE_MODEL_PATH)
+# Load tokenizer (ByT5 uses byte-level tokenization, no vocab file needed)
+tokenizer = ByT5Tokenizer()
 print(f"   Tokenizer vocab size: {len(tokenizer)}")
 
 # Load base model (offline-compatible)
