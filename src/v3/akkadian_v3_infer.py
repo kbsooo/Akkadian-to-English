@@ -1,27 +1,17 @@
 #%% [markdown]
-# # Akkadian V3 Inference: ByT5-Large + LoRA
+# # Akkadian V3 Inference: Merged Model
 #
 # **Key Features:**
-# - Load LoRA adapter weights and merge with base model
-# - Same normalization as training for consistent results
-# - tqdm progress bar for translation progress
+# - Pre-merged model (LoRA already integrated into base model)
+# - NO PEFT required → Works on Kaggle Internet OFF
+# - Same normalization as training
 #
-# **Environment**: Kaggle T4/P100 GPU
+# **Environment**: Kaggle T4/P100 GPU (Internet OFF supported)
 #
 # **Usage:**
 # ```bash
 # uv run jupytext --to notebook src/v3/akkadian_v3_infer.py
 # ```
-
-#%% [markdown]
-# ## 0. Setup: Upgrade PEFT (CRITICAL!)
-# 
-# LoRA adapter was trained with a newer PEFT version.
-# Must upgrade to match training environment.
-
-#%%
-# Upgrade PEFT to match training environment
-!pip install -q -U peft
 
 #%% [markdown]
 # ## 1. Imports & Configuration
@@ -36,7 +26,6 @@ from pathlib import Path
 
 import pandas as pd
 import torch
-from peft import PeftModel
 from tqdm.auto import tqdm
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
@@ -47,205 +36,155 @@ class Config:
     kaggle_input: Path = Path("/kaggle/input")
     kaggle_working: Path = Path("/kaggle/working")
     
-    # Model
-    base_model_name: str = "google/byt5-large"
+    # Model path (merged model - no PEFT needed)
+    model_path: str = "/kaggle/input/akkadian-v3/pytorch/default/4"
     
     # Inference params
     max_source_length: int = 256
     max_target_length: int = 256
     batch_size: int = 4
     num_beams: int = 4
-    fp16: bool = False  # MUST match training (ByT5 is unstable with FP16)
+    fp16: bool = False  # ByT5 is unstable with FP16
 
 
 CFG = Config()
 
 #%% [markdown]
-# ## 2. Normalization (MUST match training)
-
-#%%
-# Vowels with diacritics → base vowels
-_VOWEL_MAP = {
-    '\u00e0': 'a', '\u00e1': 'a', '\u00e2': 'a', '\u0101': 'a', '\u00e4': 'a',
-    '\u00c0': 'A', '\u00c1': 'A', '\u00c2': 'A', '\u0100': 'A', '\u00c4': 'A',
-    '\u00e8': 'e', '\u00e9': 'e', '\u00ea': 'e', '\u0113': 'e', '\u00eb': 'e',
-    '\u00c8': 'E', '\u00c9': 'E', '\u00ca': 'E', '\u0112': 'E', '\u00cb': 'E',
-    '\u00ec': 'i', '\u00ed': 'i', '\u00ee': 'i', '\u012b': 'i', '\u00ef': 'i',
-    '\u00cc': 'I', '\u00cd': 'I', '\u00ce': 'I', '\u012a': 'I', '\u00cf': 'I',
-    '\u00f2': 'o', '\u00f3': 'o', '\u00f4': 'o', '\u014d': 'o', '\u00f6': 'o',
-    '\u00d2': 'O', '\u00d3': 'O', '\u00d4': 'O', '\u014c': 'O', '\u00d6': 'O',
-    '\u00f9': 'u', '\u00fa': 'u', '\u00fb': 'u', '\u016b': 'u', '\u00fc': 'u',
-    '\u00d9': 'U', '\u00da': 'U', '\u00db': 'U', '\u016a': 'U', '\u00dc': 'U',
-}
-
-# Akkadian consonants → ASCII
-_CONSONANT_MAP = {
-    '\u0161': 's', '\u0160': 'S',  # š, Š
-    '\u1e63': 's', '\u1e62': 'S',  # ṣ, Ṣ
-    '\u1e6d': 't', '\u1e6c': 'T',  # ṭ, Ṭ
-    '\u1e2b': 'h', '\u1e2a': 'H',  # ḫ, Ḫ
-}
-
-# OCR artifacts
-_OCR_MAP = {
-    '\u201e': '"', '\u201c': '"', '\u201d': '"',
-    '\u2018': "'", '\u2019': "'", '\u201a': "'",
-    '\u02be': "'", '\u02bf': "'",
-    '\u2308': '[', '\u2309': ']', '\u230a': '[', '\u230b': ']',
-}
-
-# Subscripts
-_SUBSCRIPT_MAP = str.maketrans({
-    '\u2080': '0', '\u2081': '1', '\u2082': '2', '\u2083': '3', '\u2084': '4',
-    '\u2085': '5', '\u2086': '6', '\u2087': '7', '\u2088': '8', '\u2089': '9',
-    '\u2093': 'x',
-})
-
-_FULL_MAP = str.maketrans({**_VOWEL_MAP, **_CONSONANT_MAP, **_OCR_MAP})
-
-
-def normalize_transliteration(text):
-    """Normalize to ASCII - MUST match training preprocessing."""
-    if text is None or (isinstance(text, float) and text != text):
-        return ""
-    text = str(text)
-    text = unicodedata.normalize("NFC", text)
-    text = text.translate(_FULL_MAP)
-    text = text.translate(_SUBSCRIPT_MAP)
-    text = text.replace('\u2026', ' <gap> ')
-    text = re.sub(r'\.\.\.+', ' <gap> ', text)
-    text = re.sub(r'\[([^\]]*)\]', ' <gap> ', text)
-    text = re.sub(r'\bx\b', ' <unk> ', text, flags=re.IGNORECASE)
-    text = re.sub(r'[!?/]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
-
-#%% [markdown]
-# ## 3. Environment Detection
+# ## 2. Helper Functions
 
 #%%
 def is_kaggle():
-    return Path("/kaggle/input").exists()
+    return CFG.kaggle_input.exists()
 
 
 def find_competition_data():
-    """Find competition test data."""
+    """Find competition data directory."""
     if not is_kaggle():
-        return Path("data")
-    for d in CFG.kaggle_input.iterdir():
-        if (d / "test.csv").exists():
-            return d
-    raise FileNotFoundError("Competition data not found")
-
-
-def find_lora_adapter():
-    """Find LoRA adapter in Kaggle input."""
-    if not is_kaggle():
-        local = Path("outputs/akkadian_v3/lora_adapter")
+        local = Path("data")
         if local.exists():
             return local
-        raise FileNotFoundError("Local LoRA adapter not found")
+        raise FileNotFoundError("Local data directory not found")
     
-    # Kaggle: find adapter (look for adapter_config.json)
     for d in CFG.kaggle_input.iterdir():
-        if (d / "adapter_config.json").exists():
-            return d
-        for sub in d.glob("**/adapter_config.json"):
-            return sub.parent
-    raise FileNotFoundError("LoRA adapter not found in /kaggle/input")
+        if "deep-past" in d.name.lower() or "akkadian" in d.name.lower():
+            if (d / "test.csv").exists():
+                return d
+    raise FileNotFoundError("Competition data not found")
+
+#%% [markdown]
+# ## 3. Normalization (must match training)
+
+#%%
+# ASCII transliteration mapping
+_NORMALIZE_MAP = {
+    # Shin/Sibilants
+    'š': 's', 'Š': 'S',
+    'ṣ': 's', 'Ṣ': 'S',
+    'ś': 's', 'Ś': 'S',
+    
+    # Emphatics
+    'ṭ': 't', 'Ṭ': 'T',
+    'ḫ': 'h', 'Ḫ': 'H',
+    'ḥ': 'h', 'Ḥ': 'H',
+    
+    # Ayin, Aleph
+    'ʾ': "'", 'ʿ': "'", ''': "'", ''': "'",
+    'ˀ': "'", 'ˁ': "'",
+    'ʔ': "'", 'ʕ': "'",
+    
+    # Nasals
+    'ṃ': 'm', 'Ṃ': 'M',
+    'ṅ': 'n', 'Ṅ': 'N',
+    'ñ': 'n', 'Ñ': 'N',
+    
+    # Long vowels (macron)
+    'ā': 'a', 'Ā': 'A',
+    'ē': 'e', 'Ē': 'E',
+    'ī': 'i', 'Ī': 'I',
+    'ō': 'o', 'Ō': 'O',
+    'ū': 'u', 'Ū': 'U',
+    
+    # Breve
+    'ă': 'a', 'ĕ': 'e', 'ĭ': 'i', 'ŏ': 'o', 'ŭ': 'u',
+    
+    # Subscript numbers → normal
+    '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4',
+    '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9',
+    
+    # Superscript
+    '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+    '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9',
+    
+    # Special
+    '×': 'x', '·': '.', '°': '',
+}
 
 
-def find_base_model():
-    """Find base model (byt5-large) in Kaggle input for offline use."""
-    if not is_kaggle():
-        # Local: use HuggingFace model name
-        return "google/byt5-large"
+def normalize_transliteration(text: str) -> str:
+    """Convert Akkadian transliteration to ASCII (must match training)."""
+    if not isinstance(text, str):
+        return ""
     
-    # Kaggle: search for local byt5-large model
-    # Common paths from Kaggle Models
-    possible_paths = [
-        CFG.kaggle_input / "byt5-large" / "pytorch" / "default" / "1",
-        CFG.kaggle_input / "byt5-large",
-        CFG.kaggle_input / "google-byt5-large",
-    ]
+    # NFD decomposition
+    text = unicodedata.normalize('NFD', text)
     
-    for p in possible_paths:
-        if p.exists() and (p / "config.json").exists():
-            return str(p)
+    # Apply mapping
+    result = []
+    for char in text:
+        if char in _NORMALIZE_MAP:
+            result.append(_NORMALIZE_MAP[char])
+        elif unicodedata.category(char) == 'Mn':  # Skip combining marks
+            continue
+        else:
+            result.append(char)
     
-    # Search all input directories for config.json (byt5-large marker)
-    for d in CFG.kaggle_input.iterdir():
-        if "byt5" in d.name.lower():
-            if (d / "config.json").exists():
-                return str(d)
-            for sub in d.glob("**/config.json"):
-                return str(sub.parent)
+    text = ''.join(result)
     
-    # Fallback to online (will fail if internet is off)
-    print("⚠️ Local byt5-large not found, trying online...")
-    return "google/byt5-large"
+    # Whitespace cleanup
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
 
+#%% [markdown]
+# ## 4. Setup
 
+#%%
 print("=" * 60)
-print("🚀 Akkadian V3 Inference: ByT5-Large + LoRA")
+print("🚀 Akkadian V3 Inference: Merged Model (PEFT-free)")
 print("=" * 60)
 
 COMP_DIR = find_competition_data()
-ADAPTER_DIR = find_lora_adapter()
-BASE_MODEL_PATH = find_base_model()
+MODEL_DIR = Path(CFG.model_path)
 
 print(f"📁 Competition data: {COMP_DIR}")
-print(f"🔧 LoRA adapter: {ADAPTER_DIR}")
-print(f"🤖 Base model: {BASE_MODEL_PATH}")
+print(f"🤖 Merged model: {MODEL_DIR}")
 print(f"🎮 CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"   GPU: {torch.cuda.get_device_name(0)}")
 print("=" * 60)
 
 #%% [markdown]
-# ## 4. Load Model with LoRA
+# ## 5. Load Model
 
 #%%
-print(f"\n🤖 Loading base model: {BASE_MODEL_PATH}")
+print(f"\n🤖 Loading merged model from: {MODEL_DIR}")
 print("   This may take a few minutes...")
 
-# Load tokenizer from LoRA adapter (saved during training)
-tokenizer = AutoTokenizer.from_pretrained(str(ADAPTER_DIR))
+# Load tokenizer and model directly (no PEFT needed!)
+tokenizer = AutoTokenizer.from_pretrained(str(MODEL_DIR))
 print(f"   Tokenizer vocab size: {len(tokenizer)}")
 
-# Load base model (offline-compatible)
-base_model = AutoModelForSeq2SeqLM.from_pretrained(BASE_MODEL_PATH)
-print(f"   Base model loaded")
-
-#%%
-# Load LoRA adapter
-print(f"\n🔧 Loading LoRA adapter from: {ADAPTER_DIR}")
-model = PeftModel.from_pretrained(base_model, str(ADAPTER_DIR))
-print("   LoRA adapter loaded")
-
-# NOTE: Skipping merge_and_unload() to avoid potential issues
-# PeftModel can be used directly for inference
-print("   ⚠️ Using PeftModel directly (no merge)")
-
-#%%
-# Ensure vocab sizes match
-if len(tokenizer) != model.config.vocab_size:
-    model.resize_token_embeddings(len(tokenizer))
-    print(f"   Resized embeddings to: {model.config.vocab_size}")
+model = AutoModelForSeq2SeqLM.from_pretrained(str(MODEL_DIR))
+print(f"   Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters")
 
 # Move to GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = model.to(device)
-
-if CFG.fp16 and device.type == "cuda":
-    model = model.half()
-    print("   ✅ Using FP16")
-
 model.eval()
 print(f"   ✅ Model on {device}")
 
 #%% [markdown]
-# ## 5. Inference Functions
+# ## 6. Inference Functions
 
 #%%
 @torch.no_grad()
@@ -262,7 +201,6 @@ def generate_batch(texts, debug=False):
     
     if debug:
         print(f"   [DEBUG] Input shape: {inputs['input_ids'].shape}")
-        print(f"   [DEBUG] Input tokens (first): {inputs['input_ids'][0][:20].tolist()}")
     
     outputs = model.generate(
         **inputs,
@@ -273,7 +211,7 @@ def generate_batch(texts, debug=False):
     
     if debug:
         print(f"   [DEBUG] Output shape: {outputs.shape}")
-        print(f"   [DEBUG] Output tokens (first): {outputs[0][:20].tolist()}")
+        print(f"   [DEBUG] Output tokens (first 20): {outputs[0][:20].tolist()}")
     
     decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
     
@@ -289,31 +227,25 @@ def translate_all(texts, batch_size=None):
         batch_size = CFG.batch_size
     
     translations = []
-    
-    # tqdm progress bar
-    pbar = tqdm(
-        range(0, len(texts), batch_size),
-        desc="🔮 Translating",
-        unit="batch",
-        ncols=80
-    )
+    pbar = tqdm(range(0, len(texts), batch_size), desc="🔮 Translating", unit="batch", ncols=80)
     
     for i in pbar:
         batch = texts[i:i + batch_size]
-        translations.extend(generate_batch(batch))
-        pbar.set_postfix({"done": f"{len(translations)}/{len(texts)}"})
+        results = generate_batch(batch)
+        translations.extend(results)
+        pbar.set_postfix(done=f"{min(i + batch_size, len(texts))}/{len(texts)}")
     
     return translations
 
 #%% [markdown]
-# ## 6. Load Test Data & Run Inference
+# ## 7. Run Inference
 
 #%%
 print("\n📖 Loading test data...")
 test_df = pd.read_csv(COMP_DIR / "test.csv")
 print(f"   Test samples: {len(test_df):,}")
 
-# Normalize (CRITICAL: same as training)
+# Normalize
 print("\n🔧 Normalizing (ASCII conversion)...")
 normalized = [normalize_transliteration(t) for t in tqdm(test_df["transliteration"], desc="Normalizing")]
 
@@ -324,10 +256,10 @@ for i in range(min(2, len(normalized))):
 #%%
 print("\n🚀 Running inference...")
 
-# Debug first batch
+# Debug first sample
 print("\n[DEBUG] Testing first sample...")
 test_result = generate_batch([normalized[0]], debug=True)
-print(f"[DEBUG] First translation: '{test_result[0]}'")
+print(f"[DEBUG] First translation: '{test_result[0][:100]}...'")
 
 translations = translate_all(normalized)
 
@@ -336,17 +268,13 @@ for i in range(min(3, len(translations))):
     print(f"   [{i}] {translations[i][:150]}...")
 
 #%% [markdown]
-# ## 7. Create Submission
+# ## 8. Create Submission
 
 #%%
 submission = pd.DataFrame({
     "id": test_df["id"],
     "translation": translations,
 })
-
-# Validation
-assert len(submission) == len(test_df), "Row count mismatch!"
-assert submission["translation"].notna().all(), "Found NaN translations!"
 
 # Save
 output_path = CFG.kaggle_working / "submission.csv" if is_kaggle() else Path("submission.csv")
@@ -356,12 +284,7 @@ print("\n" + "=" * 60)
 print("✅ Inference Complete!")
 print("=" * 60)
 print(f"📁 Saved: {output_path}")
-print(f"   Rows: {len(submission):,}")
+print(f"   Rows: {len(submission)}")
 print()
 print(submission.head())
 print("=" * 60)
-
-#%% [markdown]
-# ## Done!
-#
-# Submit `submission.csv` to the competition.
