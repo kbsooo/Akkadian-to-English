@@ -45,7 +45,7 @@ class Config:
     max_target_length: int = 256
     batch_size: int = 4
     num_beams: int = 4
-    fp16: bool = True
+    fp16: bool = False  # MUST match training (ByT5 is unstable with FP16)
 
 
 CFG = Config()
@@ -213,10 +213,9 @@ print(f"\n🔧 Loading LoRA adapter from: {ADAPTER_DIR}")
 model = PeftModel.from_pretrained(base_model, str(ADAPTER_DIR))
 print("   LoRA adapter loaded")
 
-# Merge and unload for faster inference
-print("   Merging adapter weights...")
-model = model.merge_and_unload()
-print("   ✅ Merged successfully")
+# NOTE: Skipping merge_and_unload() to avoid potential issues
+# PeftModel can be used directly for inference
+print("   ⚠️ Using PeftModel directly (no merge)")
 
 #%%
 # Ensure vocab sizes match
@@ -240,7 +239,7 @@ print(f"   ✅ Model on {device}")
 
 #%%
 @torch.no_grad()
-def generate_batch(texts):
+def generate_batch(texts, debug=False):
     """Generate translations for a batch of texts."""
     inputs = tokenizer(
         texts,
@@ -251,6 +250,10 @@ def generate_batch(texts):
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
     
+    if debug:
+        print(f"   [DEBUG] Input shape: {inputs['input_ids'].shape}")
+        print(f"   [DEBUG] Input tokens (first): {inputs['input_ids'][0][:20].tolist()}")
+    
     outputs = model.generate(
         **inputs,
         max_length=CFG.max_target_length,
@@ -258,7 +261,16 @@ def generate_batch(texts):
         early_stopping=True,
     )
     
-    return tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    if debug:
+        print(f"   [DEBUG] Output shape: {outputs.shape}")
+        print(f"   [DEBUG] Output tokens (first): {outputs[0][:20].tolist()}")
+    
+    decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+    
+    if debug:
+        print(f"   [DEBUG] Decoded (first): '{decoded[0][:100]}'")
+    
+    return decoded
 
 
 def translate_all(texts, batch_size=None):
@@ -301,6 +313,12 @@ for i in range(min(2, len(normalized))):
 
 #%%
 print("\n🚀 Running inference...")
+
+# Debug first batch
+print("\n[DEBUG] Testing first sample...")
+test_result = generate_batch([normalized[0]], debug=True)
+print(f"[DEBUG] First translation: '{test_result[0]}'")
+
 translations = translate_all(normalized)
 
 print(f"\n📝 Sample outputs:")
