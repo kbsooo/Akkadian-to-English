@@ -145,15 +145,48 @@ def find_lora_adapter():
     raise FileNotFoundError("LoRA adapter not found in /kaggle/input")
 
 
+def find_base_model():
+    """Find base model (byt5-large) in Kaggle input for offline use."""
+    if not is_kaggle():
+        # Local: use HuggingFace model name
+        return "google/byt5-large"
+    
+    # Kaggle: search for local byt5-large model
+    # Common paths from Kaggle Models
+    possible_paths = [
+        CFG.kaggle_input / "byt5-large" / "pytorch" / "default" / "1",
+        CFG.kaggle_input / "byt5-large",
+        CFG.kaggle_input / "google-byt5-large",
+    ]
+    
+    for p in possible_paths:
+        if p.exists() and (p / "config.json").exists():
+            return str(p)
+    
+    # Search all input directories for config.json (byt5-large marker)
+    for d in CFG.kaggle_input.iterdir():
+        if "byt5" in d.name.lower():
+            if (d / "config.json").exists():
+                return str(d)
+            for sub in d.glob("**/config.json"):
+                return str(sub.parent)
+    
+    # Fallback to online (will fail if internet is off)
+    print("⚠️ Local byt5-large not found, trying online...")
+    return "google/byt5-large"
+
+
 print("=" * 60)
 print("🚀 Akkadian V3 Inference: ByT5-Large + LoRA")
 print("=" * 60)
 
 COMP_DIR = find_competition_data()
 ADAPTER_DIR = find_lora_adapter()
+BASE_MODEL_PATH = find_base_model()
 
 print(f"📁 Competition data: {COMP_DIR}")
 print(f"🔧 LoRA adapter: {ADAPTER_DIR}")
+print(f"🤖 Base model: {BASE_MODEL_PATH}")
 print(f"🎮 CUDA: {torch.cuda.is_available()}")
 if torch.cuda.is_available():
     print(f"   GPU: {torch.cuda.get_device_name(0)}")
@@ -163,15 +196,15 @@ print("=" * 60)
 # ## 4. Load Model with LoRA
 
 #%%
-print(f"\n🤖 Loading base model: {CFG.base_model_name}")
+print(f"\n🤖 Loading base model: {BASE_MODEL_PATH}")
 print("   This may take a few minutes...")
 
-# Load tokenizer
-tokenizer = ByT5Tokenizer(extra_ids=125)
+# Load tokenizer from base model path
+tokenizer = ByT5Tokenizer.from_pretrained(BASE_MODEL_PATH)
 print(f"   Tokenizer vocab size: {len(tokenizer)}")
 
-# Load base model
-base_model = AutoModelForSeq2SeqLM.from_pretrained(CFG.base_model_name)
+# Load base model (offline-compatible)
+base_model = AutoModelForSeq2SeqLM.from_pretrained(BASE_MODEL_PATH)
 print(f"   Base model loaded")
 
 #%%
