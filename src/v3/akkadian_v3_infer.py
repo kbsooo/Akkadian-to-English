@@ -28,7 +28,7 @@ import pandas as pd
 import torch
 from peft import PeftModel
 from tqdm.auto import tqdm
-from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, ByT5Tokenizer
 
 #%%
 @dataclass
@@ -199,8 +199,9 @@ print("=" * 60)
 print(f"\n🤖 Loading base model: {BASE_MODEL_PATH}")
 print("   This may take a few minutes...")
 
-# Load tokenizer (must match training)
-tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_PATH)
+# Load tokenizer (ByT5 uses byte-level, extra_ids must match training)
+# Training uses AutoTokenizer which defaults to extra_ids=125 for byt5
+tokenizer = ByT5Tokenizer(extra_ids=125)
 print(f"   Tokenizer vocab size: {len(tokenizer)}")
 
 # Load base model (offline-compatible)
