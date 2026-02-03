@@ -225,13 +225,11 @@ def generate_batch(texts, debug=False):
     if debug:
         print(f"   [DEBUG] Input shape: {inputs['input_ids'].shape}")
     
-    # Repetition penalty to prevent "the merchant ... the merchant ..." loops
+    # NOTE: NO repetition_penalty - hurts BLEU for this domain
     outputs = model.generate(
         **inputs,
         max_length=CFG.max_target_length,
         num_beams=CFG.num_beams,
-        repetition_penalty=1.2,
-        no_repeat_ngram_size=3,
         early_stopping=True,
     )
     
