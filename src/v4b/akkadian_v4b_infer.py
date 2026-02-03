@@ -142,34 +142,32 @@ def normalize_transliteration(text) -> str:
     - <content> → content
     - ˹ ˺ removed
     - ! ? / : removed (scribal notations, word dividers)
-    - Line numbers removed
+    
+    NOTE: Line numbers NOT removed - train.csv has quantities like "1 TÚG".
     """
     if text is None or (isinstance(text, float) and text != text):
         return ""
     text = str(text)
     text = unicodedata.normalize("NFC", text)
     
-    # 0. Remove line numbers at start: 1, 1', 1'', 5, 10, etc.
-    text = re.sub(r'^\d+\'{0,2}\s+', '', text)
-    text = re.sub(r'\bl\.?\s*\d+\'{0,2}\b', '', text, flags=re.IGNORECASE)
+    # 1. Handle <content> → content (scribal insertions) FIRST
+    #    Do this before gap tokens are created to avoid removing them!
+    text = re.sub(r'<<([^>]+)>>', r'\1', text)  # errant signs
+    text = re.sub(r'<([^>]+)>', r'\1', text)    # scribal insertions
     
-    # 1. Large gaps: [… …] or [...] → <big_gap>
-    text = re.sub(r'\[\s*…+\s*…*\s*\]', ' <big_gap> ', text)
-    text = re.sub(r'\[\s*\.\.\.+\s*\.\.\.+\s*\]', ' <big_gap> ', text)
+    # 2. Large gaps: [… …] or [...] → __BIG_GAP__
+    text = re.sub(r'\[\s*…+\s*…*\s*\]', ' __BIG_GAP__ ', text)
+    text = re.sub(r'\[\s*\.\.\.+\s*\.\.\.+\s*\]', ' __BIG_GAP__ ', text)
     
-    # 2. Ellipsis → <big_gap>
-    text = text.replace('\u2026', ' <big_gap> ')
-    text = re.sub(r'\.\.\.+', ' <big_gap> ', text)
+    # 3. Ellipsis → __BIG_GAP__
+    text = text.replace('\u2026', ' __BIG_GAP__ ')
+    text = re.sub(r'\.\.\.+', ' __BIG_GAP__ ', text)
     
-    # 3. [x] → <gap>
-    text = re.sub(r'\[\s*x\s*\]', ' <gap> ', text, flags=re.IGNORECASE)
+    # 4. [x] → __GAP__
+    text = re.sub(r'\[\s*x\s*\]', ' __GAP__ ', text, flags=re.IGNORECASE)
     
-    # 4. [content] → content
+    # 5. [content] → content
     text = re.sub(r'\[([^\]]+)\]', r'\1', text)
-    
-    # 5. <content> → content
-    text = re.sub(r'<([^>]+)>', r'\1', text)
-    text = re.sub(r'<<([^>]+)>>', r'\1', text)
     
     # 6. Remove half brackets (all variations)
     text = text.replace('\u2039', '').replace('\u203a', '')  # ‹ ›
@@ -185,10 +183,14 @@ def normalize_transliteration(text) -> str:
     text = re.sub(r'[!?/]', ' ', text)
     text = re.sub(r'\s*:\s*', ' ', text)  # : word divider
     
-    # 9. Standalone x → <gap>
-    text = re.sub(r'\bx\b', ' <gap> ', text, flags=re.IGNORECASE)
+    # 9. Standalone x → __GAP__
+    text = re.sub(r'\bx\b', ' __GAP__ ', text, flags=re.IGNORECASE)
     
-    # 10. Clean whitespace
+    # 10. Convert placeholders to actual tokens
+    text = text.replace('__GAP__', '<gap>')
+    text = text.replace('__BIG_GAP__', '<big_gap>')
+    
+    # 11. Clean whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
