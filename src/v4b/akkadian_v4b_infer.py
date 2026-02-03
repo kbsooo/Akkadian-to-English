@@ -150,6 +150,13 @@ def normalize_transliteration(text) -> str:
     text = str(text)
     text = unicodedata.normalize("NFC", text)
     
+    # Protect literal gap tokens before removing <content> blocks
+    text = text.replace("<gap>", "__LIT_GAP__")
+    text = text.replace("<big_gap>", "__LIT_BIG_GAP__")
+    
+    # Remove only apostrophe-style line numbers (e.g., 1', 1'')
+    text = re.sub(r"\b\d+'{1,2}\b", " ", text)
+    
     # 1. Handle <content> → content (scribal insertions) FIRST
     #    Do this before gap tokens are created to avoid removing them!
     text = re.sub(r'<<([^>]+)>>', r'\1', text)  # errant signs
@@ -189,6 +196,10 @@ def normalize_transliteration(text) -> str:
     # 10. Convert placeholders to actual tokens
     text = text.replace('__GAP__', '<gap>')
     text = text.replace('__BIG_GAP__', '<big_gap>')
+    
+    # Restore protected literal tokens
+    text = text.replace("__LIT_GAP__", "<gap>")
+    text = text.replace("__LIT_BIG_GAP__", "<big_gap>")
     
     # 11. Clean whitespace
     text = re.sub(r'\s+', ' ', text).strip()
