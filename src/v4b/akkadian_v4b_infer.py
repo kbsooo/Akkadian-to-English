@@ -141,12 +141,17 @@ def normalize_transliteration(text) -> str:
     - [content] → content (remove brackets, keep content)
     - <content> → content
     - ˹ ˺ removed
-    - ! ? / removed
+    - ! ? / : removed (scribal notations, word dividers)
+    - Line numbers removed
     """
     if text is None or (isinstance(text, float) and text != text):
         return ""
     text = str(text)
     text = unicodedata.normalize("NFC", text)
+    
+    # 0. Remove line numbers at start: 1, 1', 1'', 5, 10, etc.
+    text = re.sub(r'^\d+\'{0,2}\s+', '', text)
+    text = re.sub(r'\bl\.?\s*\d+\'{0,2}\b', '', text, flags=re.IGNORECASE)
     
     # 1. Large gaps: [… …] or [...] → <big_gap>
     text = re.sub(r'\[\s*…+\s*…*\s*\]', ' <big_gap> ', text)
@@ -159,23 +164,26 @@ def normalize_transliteration(text) -> str:
     # 3. [x] → <gap>
     text = re.sub(r'\[\s*x\s*\]', ' <gap> ', text, flags=re.IGNORECASE)
     
-    # 4. [content] → content (KEY DIFFERENCE!)
+    # 4. [content] → content
     text = re.sub(r'\[([^\]]+)\]', r'\1', text)
     
     # 5. <content> → content
     text = re.sub(r'<([^>]+)>', r'\1', text)
     text = re.sub(r'<<([^>]+)>>', r'\1', text)
     
-    # 6. Remove half brackets
-    text = text.replace('\u2308', '').replace('\u2309', '')
-    text = text.replace('\u230a', '').replace('\u230b', '')
+    # 6. Remove half brackets (all variations)
+    text = text.replace('\u2039', '').replace('\u203a', '')  # ‹ ›
+    text = text.replace('\u2308', '').replace('\u2309', '')  # ⌈ ⌉
+    text = text.replace('\u230a', '').replace('\u230b', '')  # ⌊ ⌋
+    text = text.replace('˹', '').replace('˺', '')  # literal
     
     # 7. Character maps
     text = text.translate(_FULL_MAP)
     text = text.translate(_SUBSCRIPT_MAP)
     
-    # 8. Remove scribal notations
+    # 8. Remove scribal notations AND word dividers
     text = re.sub(r'[!?/]', ' ', text)
+    text = re.sub(r'\s*:\s*', ' ', text)  # : word divider
     
     # 9. Standalone x → <gap>
     text = re.sub(r'\bx\b', ' <gap> ', text, flags=re.IGNORECASE)

@@ -183,12 +183,18 @@ def normalize_transliteration(text) -> str:
     - [content] → content (remove brackets, keep content)
     - <content> → content (scribal insertions)
     - ˹ ˺ removed (partial breaks)
-    - ! ? / removed (scribal notations)
+    - ! ? / : . removed (scribal notations, word dividers)
+    - Line numbers (1, 1', 1'') removed
     """
     if text is None or (isinstance(text, float) and text != text):
         return ""
     text = str(text)
     text = unicodedata.normalize("NFC", text)
+    
+    # 0. Remove line numbers at start: 1, 1', 1'', 5, 10, etc.
+    text = re.sub(r'^\d+\'{0,2}\s+', '', text)
+    # Also remove mid-text line references like "l. 5" or "line 10"
+    text = re.sub(r'\bl\.?\s*\d+\'{0,2}\b', '', text, flags=re.IGNORECASE)
     
     # 1. Handle large gaps first: [… …] or [... ...] → <big_gap>
     text = re.sub(r'\[\s*…+\s*…*\s*\]', ' <big_gap> ', text)
@@ -202,33 +208,43 @@ def normalize_transliteration(text) -> str:
     text = re.sub(r'\[\s*x\s*\]', ' <gap> ', text, flags=re.IGNORECASE)
     
     # 4. Handle [content] → content (remove brackets, keep content)
-    # This is the KEY difference from V4!
     text = re.sub(r'\[([^\]]+)\]', r'\1', text)
     
     # 5. Handle <content> → content (scribal insertions)
     text = re.sub(r'<([^>]+)>', r'\1', text)
     text = re.sub(r'<<([^>]+)>>', r'\1', text)  # errant signs
     
-    # 6. Remove half brackets (partial breaks): ˹ ˺
-    text = text.replace('\u2308', '')  # ˹
-    text = text.replace('\u2309', '')  # ˺
-    text = text.replace('\u230a', '')  # ⌊
-    text = text.replace('\u230b', '')  # ⌋
+    # 6. Remove half brackets (partial breaks)
+    # Correct Unicode: ˹ (U+2039/U+203A or variations) and ⌈⌉⌊⌋ (U+2308-230B)
+    text = text.replace('\u2039', '')  # ‹
+    text = text.replace('\u203a', '')  # ›
+    text = text.replace('\u2308', '')  # ⌈ (left ceiling)
+    text = text.replace('\u2309', '')  # ⌉ (right ceiling)
+    text = text.replace('\u230a', '')  # ⌊ (left floor)
+    text = text.replace('\u230b', '')  # ⌋ (right floor)
+    # Also try actual half bracket characters used in Assyriology
+    text = text.replace('˹', '')  # if present as literal
+    text = text.replace('˺', '')  # if present as literal
     
     # 7. Apply character maps (diacritics, consonants, quotes)
     text = text.translate(_FULL_MAP)
     text = text.translate(_SUBSCRIPT_MAP)
     
-    # 8. Remove scribal notations: ! ? /
+    # 8. Remove scribal notations AND word dividers: ! ? / : .
+    # Note: . is word divider in OA, but also used in other contexts
+    # We remove : unconditionally and . only when standalone (word divider)
     text = re.sub(r'[!?/]', ' ', text)
+    text = re.sub(r'\s*:\s*', ' ', text)  # : word divider
+    # Don't remove all . because they're part of sign names like KÙ.BABBAR
     
-    # 9. Handle standalone x → <gap>
+    # 9. Handle standalone x → <gap> (x = unknown/broken sign)
     text = re.sub(r'\bx\b', ' <gap> ', text, flags=re.IGNORECASE)
     
     # 10. Clean up whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     
     return text
+
 
 
 def normalize_translation(text) -> str:
