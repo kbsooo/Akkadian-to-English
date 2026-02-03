@@ -7,6 +7,19 @@
 # Data input: data/v5 or Kaggle input containing v5_* files
 
 #%% [markdown]
+# ## 0. Setup (Colab)
+#
+# Mount Google Drive if running on Colab.
+
+#%%
+try:
+    from google.colab import drive  # type: ignore
+
+    drive.mount("/content/drive")
+except Exception:
+    pass
+
+#%% [markdown]
 # ## 1. Imports & Configuration
 
 #%%
@@ -17,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -185,6 +199,62 @@ class LogCallback(TrainerCallback):
             print(f"   Geo:  {metrics.get('eval_geo_mean', 0):.2f}\n{'─'*40}")
 
 
+class HistoryCallback(TrainerCallback):
+    """Collect training/eval metrics for plotting."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.train_steps: list[int] = []
+        self.train_losses: list[float] = []
+        self.eval_epochs: list[float] = []
+        self.eval_bleu: list[float] = []
+        self.eval_chrf: list[float] = []
+        self.eval_geo: list[float] = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs and "loss" in logs:
+            self.train_steps.append(int(state.global_step))
+            self.train_losses.append(float(logs["loss"]))
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+        epoch = float(state.epoch) if state.epoch is not None else 0.0
+        self.eval_epochs.append(epoch)
+        self.eval_bleu.append(float(metrics.get("eval_bleu", 0.0)))
+        self.eval_chrf.append(float(metrics.get("eval_chrf", 0.0)))
+        self.eval_geo.append(float(metrics.get("eval_geo_mean", 0.0)))
+
+    def plot(self):
+        if not self.train_steps and not self.eval_epochs:
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+        if self.train_steps:
+            axes[0].plot(self.train_steps, self.train_losses, label="train_loss")
+            axes[0].set_title(f"{self.label} Train Loss")
+            axes[0].set_xlabel("step")
+            axes[0].set_ylabel("loss")
+            axes[0].grid(True, alpha=0.3)
+        else:
+            axes[0].set_visible(False)
+
+        if self.eval_epochs:
+            axes[1].plot(self.eval_epochs, self.eval_bleu, label="BLEU")
+            axes[1].plot(self.eval_epochs, self.eval_chrf, label="chrF")
+            axes[1].plot(self.eval_epochs, self.eval_geo, label="GeoMean")
+            axes[1].set_title(f"{self.label} Eval Metrics")
+            axes[1].set_xlabel("epoch")
+            axes[1].set_ylabel("score")
+            axes[1].legend()
+            axes[1].grid(True, alpha=0.3)
+        else:
+            axes[1].set_visible(False)
+
+        fig.tight_layout()
+        plt.show()
+
+
 #%% [markdown]
 # ## 3. Load Data
 
@@ -264,6 +334,7 @@ if CFG.use_publications_stage and pub_df is not None and len(pub_df) > 0:
     pub_train_ds = to_dataset(pub_df)
 
     data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+    history_a = HistoryCallback("Stage A")
 
     stage_a_args = dict(
         output_dir=str(CFG.output_dir / "stage_a_checkpoints"),
@@ -298,10 +369,11 @@ if CFG.use_publications_stage and pub_df is not None and len(pub_df) > 0:
         train_dataset=pub_train_ds,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=[LogCallback("Stage A")],
+        callbacks=[LogCallback("Stage A"), history_a],
     )
 
     trainer.train()
+    history_a.plot()
 else:
     print("\n⏭️  Stage A skipped (no publications data or disabled)")
 
@@ -349,6 +421,7 @@ except TypeError:
     stage_b_args["eval_strategy"] = stage_b_args.pop("evaluation_strategy")
     training_args = Seq2SeqTrainingArguments(**stage_b_args)
 
+history_b = HistoryCallback("Stage B")
 trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
@@ -357,10 +430,11 @@ trainer = Seq2SeqTrainer(
     processing_class=tokenizer,
     data_collator=data_collator,
     compute_metrics=build_compute_metrics(tokenizer),
-    callbacks=[LogCallback("Stage B")],
+    callbacks=[LogCallback("Stage B"), history_b],
 )
 
 trainer.train()
+history_b.plot()
 
 #%% [markdown]
 # ## 8. Save Model
