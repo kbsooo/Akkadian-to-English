@@ -136,6 +136,17 @@ def resolve_data_dir() -> Path:
         if p.exists():
             return p
 
+    # Colab common locations (Google Drive)
+    colab_candidates = [
+        Path("/content/drive/MyDrive/akkadian/data/v5b"),
+        Path("/content/drive/MyDrive/akkadian/v5b"),
+        Path("/content/drive/MyDrive/data/v5b"),
+        Path("/content/drive/MyDrive/v5b"),
+    ]
+    for p in colab_candidates:
+        if (p / "v5_sentence_train.csv").exists():
+            return p
+
     local = Path("data/v5b")
     if local.exists():
         return local
@@ -150,7 +161,10 @@ def resolve_data_dir() -> Path:
             if (d / "v5_sentence_train.csv").exists():
                 return d
 
-    raise FileNotFoundError("V5b data directory not found. Set V5B_DATA_DIR or place data/v5b.")
+    raise FileNotFoundError(
+        "V5b data directory not found. Set V5B_DATA_DIR or place data/v5b. "
+        "For Colab, put data in /content/drive/MyDrive/akkadian/data/v5b (or similar)."
+    )
 
 
 def resolve_glossary_path(data_dir: Path) -> Optional[Path]:
