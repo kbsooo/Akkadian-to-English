@@ -1,16 +1,18 @@
-#%% [markdown]
+# %% [markdown]
 # # Akkadian V5b Inference (Retrieval + Glossary Prompt)
 
-#%% [markdown]
+# %% [markdown]
 # ## 1. Imports & Configuration
 
-#%%
+# %%
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
 import re
+import shutil
+import tempfile
 import unicodedata
 from collections import Counter
 
@@ -18,16 +20,16 @@ import numpy as np
 import pandas as pd
 import torch
 from tqdm.auto import tqdm
-from transformers import AutoModelForSeq2SeqLM, ByT5Tokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 
-#%%
+# %%
 @dataclass
 class Config:
     kaggle_input: Path = Path("/kaggle/input")
     kaggle_working: Path = Path("/kaggle/working")
 
-    model_size: str = "base"  # "base" or "large"
+    model_size: str = "small"  # "small", "base" or "large"
     model_path: Path = field(init=False)
 
     max_source_length: int = 256
@@ -43,13 +45,15 @@ class Config:
     jaccard_max_candidates: int = 500
 
     def __post_init__(self):
-        if self.model_size == "base":
+        if self.model_size == "small":
+            self.model_path = self.kaggle_input / "akkadian-v5b-small/pytorch/default/1"
+        elif self.model_size == "base":
             self.model_path = self.kaggle_input / "akkadian-v5b-base/pytorch/default/1"
         else:
             self.model_path = self.kaggle_input / "akkadian-v5b-large/pytorch/default/1"
 
 
-CFG = Config(model_size="base")
+CFG = Config(model_size="small")
 
 # -----------------------------
 # V5 normalization (inline for Kaggle)
@@ -301,10 +305,10 @@ def build_prompt_with_retrieval(
     return prompt
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 2. Helper Functions
 
-#%%
+# %%
 
 def is_kaggle() -> bool:
     return CFG.kaggle_input.exists()
@@ -377,10 +381,10 @@ def load_glossary(path: Path) -> dict[str, list[str]]:
     return {k: list(v) for k, v in data.items()}
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 3. Setup
 
-#%%
+# %%
 print("=" * 60)
 print(f"🚀 Akkadian V5b Inference: {CFG.model_size.upper()}")
 print("=" * 60)
@@ -398,21 +402,54 @@ if torch.cuda.is_available():
 print("=" * 60)
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 4. Load Model
 
-#%%
+# %%
 print(f"\n🤖 Loading model from: {MODEL_DIR}")
-
-# ByT5 vocab: 256 bytes + specials + extra_ids
-# Use ByT5Tokenizer for consistency
-
-tokenizer = ByT5Tokenizer(extra_ids=125)
-print(f"   Tokenizer vocab: {len(tokenizer)}")
 
 model = AutoModelForSeq2SeqLM.from_pretrained(str(MODEL_DIR))
 print(f"   Model vocab: {model.config.vocab_size}")
 print(f"   Params: {sum(p.numel() for p in model.parameters()):,}")
+
+def load_autotokenizer_with_fix(model_dir: Path):
+    """Load AutoTokenizer from local files only.
+    If tokenizer_config.json is malformed (extra_special_tokens as list),
+    patch it in a temp directory and retry.
+    """
+    try:
+        return AutoTokenizer.from_pretrained(str(model_dir), use_fast=False, local_files_only=True)
+    except Exception as e:
+        print(f"   ⚠️ AutoTokenizer local load failed: {e}")
+        src_cfg = model_dir / "tokenizer_config.json"
+        if not src_cfg.exists():
+            raise
+
+        with src_cfg.open("r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        extra = cfg.get("extra_special_tokens")
+        if isinstance(extra, list):
+            # transformers expects dict here; list triggers AttributeError(keys)
+            cfg["extra_special_tokens"] = {}
+        else:
+            raise
+
+        tmp_dir = Path(tempfile.mkdtemp(prefix="tokfix_"))
+        for name in ["tokenizer_config.json", "special_tokens_map.json", "config.json"]:
+            src = model_dir / name
+            if src.exists():
+                shutil.copy2(src, tmp_dir / name)
+        with (tmp_dir / "tokenizer_config.json").open("w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+        print("   ↪ Patched tokenizer_config.json (extra_special_tokens list -> dict) and retrying AutoTokenizer")
+        return AutoTokenizer.from_pretrained(str(tmp_dir), use_fast=False, local_files_only=True)
+
+
+tokenizer = load_autotokenizer_with_fix(MODEL_DIR)
+
+print(f"   Tokenizer vocab: {len(tokenizer)}")
+print(f"   Tokenizer class: {tokenizer.__class__.__name__}")
 
 assert len(tokenizer) == model.config.vocab_size, "Vocab mismatch!"
 print("   ✅ Vocab match")
@@ -423,10 +460,10 @@ model.eval()
 print(f"   ✅ Model on {device}")
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 5. Load TM + Glossary
 
-#%%
+# %%
 TM_PAIRS = []
 GLOSSARY = None
 RETRIEVER = None
@@ -451,10 +488,10 @@ if TM_PAIRS:
     RETRIEVER = build_retriever([p.get("src", "") for p in TM_PAIRS], prefer_tfidf=CFG.prefer_tfidf)
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 6. Inference
 
-#%%
+# %%
 @torch.no_grad()
 def generate_batch(texts, debug: bool = False):
     inputs = tokenizer(
@@ -494,10 +531,10 @@ def translate_all(texts, batch_size=None):
     return translations
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 7. Run Inference
 
-#%%
+# %%
 print("\n📖 Loading test data...")
 test_df = pd.read_csv(COMP_DIR / "test.csv")
 print(f"   Test samples: {len(test_df):,}")
@@ -539,10 +576,10 @@ for i in range(min(3, len(translations))):
     print(f"   [{i}] {translations[i][:150]}...")
 
 
-#%% [markdown]
+# %% [markdown]
 # ## 8. Submission
 
-#%%
+# %%
 submission = pd.DataFrame({
     "id": test_df["id"],
     "translation": translations,

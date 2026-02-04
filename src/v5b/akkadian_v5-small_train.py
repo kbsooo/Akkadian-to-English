@@ -46,7 +46,7 @@ from datasets import Dataset
 from sacrebleu.metrics import BLEU, CHRF
 from transformers import (
     AutoModelForSeq2SeqLM,
-    AutoTokenizer,
+    ByT5Tokenizer,
     DataCollatorForSeq2Seq,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
@@ -462,7 +462,7 @@ else:
 
 print(f"\n🤖 Loading model: {CFG.model_name}")
 
-tokenizer = AutoTokenizer.from_pretrained(CFG.model_name)
+tokenizer = ByT5Tokenizer.from_pretrained(CFG.model_name)
 model = AutoModelForSeq2SeqLM.from_pretrained(CFG.model_name)
 
 print(f"   Tokenizer: {len(tokenizer)}, Model vocab: {model.config.vocab_size}")
