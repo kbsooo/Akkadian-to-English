@@ -10,10 +10,10 @@
 | V4 | ByT5-base | 250M | 1,561 + pub | OCR noise augment, V4b-style preprocessing | — |
 | V4B | ByT5-base | 250M | 1,561 only | Competition-aligned gap/bracket handling | — |
 | V5 | ByT5-base | 250M | sent+pub (2-stage) | Publications DAPT → sentence-level FT | — |
-| V5B | ByT5-small | 80M | V5 + glossary | Glossary prompting (50% dropout), TM retrieval | — |
-| V5C | ByT5-small | 80M | V5 sent only | Output guardrails, early stopping, MPS support | — |
-| V5D | ByT5-small | 80M | 2,854+319 (v5d) | Simplified, EarlyStoppingCallback | — |
-| **V6** | **ByT5-small** | **80M** | **7,391+848** | **First-word anchor extraction, tokenizer saved** | **11.0** |
+| V5B | ByT5-small | ~300M | V5 + glossary | Glossary prompting (50% dropout), TM retrieval | — |
+| V5C | ByT5-small | ~300M | V5 sent only | Output guardrails, early stopping, MPS support | — |
+| V5D | ByT5-small | ~300M | 2,854+319 (v5d) | Simplified, EarlyStoppingCallback | — |
+| **V6** | **ByT5-small** | **~300M** | **7,391+848** | **First-word anchor extraction, tokenizer saved** | **11.0** |
 
 **Current best score: 11.0 (from V6)**
 **Top 1 on leaderboard: 38.7** — gap of 27.7 points.
@@ -54,7 +54,7 @@
 - **Problem:** Stage A has no validation, blind training
 
 ### V5B-V5C-V5D: Small Model + Glossary
-- Switched to ByT5-small (80M) for speed
+- Switched to ByT5-small (~300M) for speed and overfitting control
 - Introduced glossary prompting: `GLOSSARY: tok1=trans1; tok2=trans2 ||| source`
 - 50% dropout during training, 0% during eval
 - Early stopping (patience=3)
@@ -72,20 +72,19 @@
 
 ## 3. Critical Problems Found
 
-### 3.1 CATASTROPHIC: ByT5-small is Too Small
+### 3.1 MODEL SIZE: ByT5-small May Be Adequate — Other Issues Are More Critical
 
-**This is the #1 reason for the 11.0 score.** The entire V5B→V6 trajectory has been using `google/byt5-small` (80M params). For context:
+**Previously estimated at 80M, but ByT5-small actually has ~300M parameters** (verified from model config: d_model=1472, 12 encoder layers, 4 decoder layers, gated-gelu FFN). This makes it comparable in total parameters to mT5-base (580M), though mT5-base has ~33% of parameters in its 250K-vocab embedding layer while ByT5-small uses only 384-token byte embeddings.
 
-| Model | Params | What Top Competitors Use |
-|-------|--------|------------------------|
-| ByT5-small | 80M | ← YOU ARE HERE |
-| ByT5-base | 250M | Some competitors |
-| mT5-base | 580M | Many competitors |
-| NLLB-200-distilled | 600M | Many competitors |
+| Model | Params | Notes |
+|-------|--------|-------|
+| ByT5-small | ~300M | ← CURRENT. Byte-level, tiny embeddings, all params go to transformer layers |
+| mT5-base | 580M | ~33% in embeddings (250K vocab). Effective transformer capacity similar to ByT5-small |
+| NLLB-200-distilled | 600M | Multilingual, but no Akkadian in pretraining |
+| ByT5-base | ~580M | Same architecture, 2x capacity. Consider if data > 15K pairs |
 | mT5-large | 1.2B | Top competitors (with LoRA) |
-| ByT5-large + LoRA | ~1.2B | You tried in V3 but abandoned |
 
-**80M parameters cannot capture the morphological complexity of Akkadian.** The top-1 score (38.7) is from teams using models 3-15× larger.
+**V7 decision (see V7_STRATEGY.md §2.1):** Keep ByT5-small. Research shows ByT5 outperforms mT5 by +2–5 chrF++ in the 400–10K data regime. The 11.0 score is primarily caused by issues #2–#6 below, not model capacity.
 
 ### 3.2 CRITICAL: Glossary is Fundamentally Broken
 
@@ -113,12 +112,12 @@ Your normalization strips ALL diacritics:
 
 **The top competitors preserve diacritics.** The hidden test data contains diacritics. If your model never sees them in training, it can't match them.
 
-### 3.4 HIGH: 71% of Available Data Unused
+### 3.4 HIGH: Sentence Extraction Coverage Low
 
-- published_texts.csv has 7,953 documents with translations
-- Only 2,308 (29%) are used in V6
-- 5,641 documents with translations are completely ignored
-- The first-word anchor extraction has only 46.6% success rate
+- published_texts.csv has 7,953 documents with **transliterations** (NOT translations — the `AICC_translation` column contains OARE API URLs, not actual translation text)
+- Translations come from Sentences_Oare (9,782 sentence-level translations linked via text_uuid)
+- Only 2,308 of these published_texts documents have been joined with Sentences_Oare via first-word anchor extraction
+- V6 first-word anchor extraction has only 46.6% success rate — V7 improves to ~97.9% with minimal-normalization matching
 
 ### 3.5 HIGH: 222 Original Train Documents Missing
 
@@ -177,8 +176,8 @@ annotated                  285      0.72              0.56      WORST
 1. Onomasticon.csv (curated name list) — released by competition organizers
 2. Old Assyrian Grammars dataset on Kaggle
 3. Old Assyrian Kitepe Tablets PDFs
-4. eBL Dictionary definitions (19,215 entries)
-5. 5,641 untapped published_texts documents
+4. eBL Dictionary definitions (19,215 entries) — for glossary building
+5. ~5,231 unextracted Sentences_Oare entries (V6 only extracted 46.6%)
 
 ---
 
@@ -188,12 +187,12 @@ Based on all evidence, the 11.0 score is caused by a **combination of compoundin
 
 | Root Cause | Impact | Fixable? |
 |-----------|--------|----------|
-| ByT5-small (80M) too small | CRITICAL — insufficient capacity | Yes: use mT5-base (580M) |
 | Broken glossary sending wrong signals | HIGH — actively hurts training | Yes: remove or fix |
 | Diacritics stripped | HIGH — loses linguistic information | Yes: preserve diacritics |
-| Max seq length 256 is too short | MEDIUM — truncates long examples | Yes: increase to 512 |
-| No post-processing | MEDIUM — raw MT output has errors | Yes: add LLM post-proc |
-| Missing training data | MEDIUM — 71% unused | Yes: better extraction |
+| Low sentence extraction rate (46.6%) | HIGH — misses available data | Yes: improve matching |
+| No post-processing | HIGH — raw MT output has errors | Yes: add post-proc pipeline |
+| Max seq length 256 is too short | MEDIUM — truncates long examples | Yes: increase to 384 |
+| 78 duplicate pairs + 385 outliers | LOW — noisy training data | Yes: filter out |
 
 **If the top teams score 38.7 with proper setup, and your setup has 6 compounding issues, a score of 11.0 is actually explained.**
 
@@ -203,11 +202,11 @@ Based on all evidence, the 11.0 score is caused by a **combination of compoundin
 
 ### TIER 1: Must Do (11.0 → 30+)
 
-**A. Switch to mT5-base or NLLB-200-distilled (580-600M params)**
-- 7× more parameters than ByT5-small
-- Pretrained on 101+ languages including related Semitic languages
-- Fits within Kaggle 9h GPU limit
-- mT5-base specifically was mentioned in top-performing discussion notebooks
+**A. ~~Switch to mT5-base~~ → Keep ByT5-small (SUPERSEDED by V7_STRATEGY.md §2.1)**
+- ByT5-small has ~300M params (not 80M as initially estimated), comparable transformer capacity to mT5-base
+- Research (arxiv:2302.14220) shows ByT5 > mT5 by +2–5 chrF++ at 400–10K examples
+- Byte-level tokenization handles Akkadian diacritics natively without vocabulary issues
+- Reconsider ByT5-base (~580M) only if data exceeds 15K pairs
 
 **B. STOP stripping diacritics — preserve them**
 - The organizers explicitly said this was wrong
@@ -228,8 +227,8 @@ Based on all evidence, the 11.0 score is caused by a **combination of compoundin
 
 **E. Recover all missing training data**
 - Include ALL 1,561 original train.csv documents
-- Extract more from published_texts.csv (5,641 untapped)
-- Total target: 12,000-15,000 pairs
+- Improve Sentences_Oare extraction rate (V7 achieves ~97.9% match with minimal normalization)
+- Total target: ~10,000 pairs from improved extraction pipeline
 
 **F. Use Onomasticon for name handling**
 - Download from Kaggle supplementary dataset
@@ -281,35 +280,31 @@ Based on all evidence, the 11.0 score is caused by a **combination of compoundin
 
 ---
 
-## 7. Recommended V7 Architecture
+## 7. Final V7 Architecture (see V7_STRATEGY.md for details)
 
 ```
-Model: google/mt5-base (580M params)
-  OR: facebook/nllb-200-distilled-600M
-
-Tokenizer: SentencePiece (built-in with mT5/NLLB)
-  - Preserves diacritics natively
-  - BPE subword tokenization
+Model: google/byt5-small (~300M params)
+  - Byte-level tokenization: handles Akkadian diacritics natively
+  - Tiny embedding layer (384 vocab) → all capacity goes to transformer
 
 Training:
-  - Data: V7 expanded (12,000-15,000 pairs)
-  - Epochs: 10-15 with early stopping (patience=3)
-  - LR: 3e-4 with cosine schedule
+  - Data: V7 expanded (~9,500-10,000 pairs)
+  - Epochs: 15 with early stopping (patience=3)
+  - LR: 1e-4 with warmup_ratio=0.1
   - Batch: 4 × 4 accumulation = 16 effective
-  - Max seq: 512
+  - Max seq: 384 (covers 93.6% src, 99.7% hidden test)
   - NO glossary prompting
+  - FP32 (ByT5 requires full precision)
   - Metric: geo_mean(BLEU, chrF++)
 
 Inference:
-  - Beam search: 5 beams
-  - Length penalty: 1.0
-  - No repeat ngram: 3
-  - Post-processing: Onomasticon name repair
+  - MBR decoding: 8 candidates, chrF++ consensus
+  - Post-processing: rule-based → Onomasticon → document consistency
 
 Post-Processing:
-  - Onomasticon lookup for name correction
-  - Gap marker format check
-  - Number format normalization
+  - Gap marker normalization
+  - Onomasticon name repair (fuzzy match cutoff=0.85)
+  - Document-level name consistency enforcement
 ```
 
 ---
@@ -319,14 +314,15 @@ Post-Processing:
 | Change | Expected Score | Reasoning |
 |--------|---------------|-----------|
 | Current V6 | 11.0 | Baseline |
-| + Switch to mT5-base | 25-28 | Proper model capacity |
-| + Preserve diacritics | 28-31 | Match evaluation format |
-| + Remove broken glossary | 31-33 | Stop poisoning training |
-| + Increase to max_len=512 | 33-34 | Less truncation |
-| + More training data | 34-35 | More examples |
-| + Onomasticon name repair | 35-36 | Fix #1 error source |
-| + LLM post-processing | 36-37 | Polish output |
-| + Ensemble | 37-38+ | Consistency |
+| + Remove broken glossary | 13-15 | Stop poisoning training signal |
+| + Improved data extraction (~10K pairs) | 16-18 | +32% training data via better matching |
+| + max_len=384 | 18-20 | Less truncation |
+| + Preserve diacritics (š, ṣ, ṭ) | 20-23 | Match test format, preserve phonemes |
+| + Rule-based post-processing | 23-24 | Gap/number/whitespace cleanup |
+| + Onomasticon name repair | 26-29 | Fix #1 error source |
+| + MBR decoding (n=8) | 29-31 | Stable consensus translation |
+| + Glossary-assisted inference | 31-33 | OA_Lexicon+eBL Dict lookup |
+| + LLM post-processing (optional) | 33-36 | Grammar/coherence polish |
 
 ---
 
@@ -343,7 +339,7 @@ Data:
 /data/v6/v6_val.csv            → Current validation data (848 rows)
 /data/v6/v6_glossary.json      → BROKEN glossary (DO NOT USE)
 /data/train.csv                → Original data (1,561 docs)
-/data/published_texts.csv      → 7,953 docs (71% unused)
+/data/published_texts.csv      → 7,953 docs (transliterations only; AICC_translation is URL, not text)
 /data/Sentences_Oare_FirstWord_LinNum.csv → 9,782 sentences
 /data/OA_Lexicon_eBL.csv       → 39,332 word forms
 /data/eBL_Dictionary.csv       → 19,215 definitions

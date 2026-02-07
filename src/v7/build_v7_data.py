@@ -29,8 +29,8 @@ OUTPUT_DIR = "data_v7"
 # Quality filter thresholds
 MIN_CHARS = 10
 MIN_WORDS = 2
-MIN_RATIO = 0.15   # tgt_words / src_words
-MAX_RATIO = 6.0
+MIN_RATIO = 0.4    # tgt_words / src_words — 0.15 was too permissive, let through misaligned pairs
+MAX_RATIO = 3.5    # 6.0 was too loose — Akkadian→English rarely exceeds 3× word expansion
 MAX_SEGMENT_CHARS = 2000  # skip extremely long segments
 
 # Split
@@ -55,14 +55,30 @@ subprocess.check_call([
 print("Dependencies ready: kagglehub, pandas, tqdm")
 
 # %% [markdown]
-# ## 2. Download Competition Data
+# ## 2. Locate Competition Data
 
 # %%
-import kagglehub
 import os
 
-comp_path = kagglehub.competition_download(COMPETITION)
-print(f"Competition data: {comp_path}")
+# Try local data directory first, then kagglehub, then Kaggle input
+_script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in dir() else os.getcwd()
+_local_data = os.path.join(os.path.dirname(os.path.dirname(_script_dir)), "data")
+
+if os.path.isfile(os.path.join(_local_data, "train.csv")):
+    comp_path = _local_data
+    print(f"Competition data (local): {comp_path}")
+elif os.path.isdir("/kaggle/input"):
+    # Running on Kaggle
+    for d in os.listdir("/kaggle/input"):
+        if os.path.isfile(f"/kaggle/input/{d}/train.csv"):
+            comp_path = f"/kaggle/input/{d}"
+            break
+    print(f"Competition data (Kaggle): {comp_path}")
+else:
+    import kagglehub
+    comp_path = kagglehub.competition_download(COMPETITION)
+    print(f"Competition data (downloaded): {comp_path}")
+
 for f in sorted(os.listdir(comp_path)):
     fp = os.path.join(comp_path, f)
     if os.path.isfile(fp):
@@ -76,6 +92,7 @@ for f in sorted(os.listdir(comp_path)):
 import pandas as pd
 
 train_og = pd.read_csv(os.path.join(comp_path, "train.csv"))
+test_og = pd.read_csv(os.path.join(comp_path, "test.csv"))
 sentences_df = pd.read_csv(os.path.join(comp_path, "Sentences_Oare_FirstWord_LinNum.csv"))
 published_df = pd.read_csv(os.path.join(comp_path, "published_texts.csv"))
 lexicon_df = pd.read_csv(os.path.join(comp_path, "OA_Lexicon_eBL.csv"))
@@ -83,6 +100,7 @@ dictionary_df = pd.read_csv(os.path.join(comp_path, "eBL_Dictionary.csv"))
 
 print("Raw data loaded:")
 print(f"  train.csv:          {len(train_og):,} rows")
+print(f"  test.csv:           {len(test_og):,} rows")
 print(f"  Sentences_Oare:     {len(sentences_df):,} rows")
 print(f"  published_texts:    {len(published_df):,} rows")
 print(f"  OA_Lexicon:         {len(lexicon_df):,} rows")
@@ -90,6 +108,14 @@ print(f"  eBL_Dictionary:     {len(dictionary_df):,} rows")
 
 # Precompute ID sets
 train_ids = set(train_og["oare_id"].dropna().unique())
+# CRITICAL: Exclude test document IDs to prevent data leakage
+test_ids = set()
+if "text_id" in test_og.columns:
+    test_ids = set(test_og["text_id"].dropna().unique())
+elif "oare_id" in test_og.columns:
+    test_ids = set(test_og["oare_id"].dropna().unique())
+print(f"  Test document IDs to exclude: {len(test_ids)}")
+
 sent_uuids = set(sentences_df["text_uuid"].dropna().unique())
 pub_ids = set(published_df["oare_id"].dropna().unique())
 
@@ -376,35 +402,39 @@ path_b_pairs = []
 path_b_stats = {"matched": 0, "unmatched": 0, "no_trans": 0}
 
 for oid in tqdm(path_b_target_ids, desc="Path B"):
-    # Get transliteration from published_texts (has diacritics + {} braces)
-    pub_row = published_df[published_df["oare_id"] == oid]
-    if pub_row.empty:
-        path_b_stats["no_trans"] += 1
-        continue
+    try:
+        # Get transliteration from published_texts (has diacritics + {} braces)
+        pub_row = published_df[published_df["oare_id"] == oid]
+        if pub_row.empty:
+            path_b_stats["no_trans"] += 1
+            continue
 
-    transliteration = pub_row.iloc[0].get("transliteration", "")
-    if not transliteration or str(transliteration) == "nan":
-        path_b_stats["no_trans"] += 1
-        continue
+        transliteration = pub_row.iloc[0].get("transliteration", "")
+        if not transliteration or str(transliteration) == "nan":
+            path_b_stats["no_trans"] += 1
+            continue
 
-    # Get sentences from Sentences_Oare
-    sent_rows = sentences_df[sentences_df["text_uuid"] == oid]
-    if sent_rows.empty:
-        continue
+        # Get sentences from Sentences_Oare
+        sent_rows = sentences_df[sentences_df["text_uuid"] == oid]
+        if sent_rows.empty:
+            continue
 
-    # Extract pairs
-    pairs = extract_sentence_pairs(transliteration, sent_rows)
+        # Extract pairs
+        pairs = extract_sentence_pairs(transliteration, sent_rows)
 
-    if pairs:
-        path_b_stats["matched"] += 1
-        for src, tgt in pairs:
-            path_b_pairs.append({
-                "oare_id": oid,
-                "src_raw": src,
-                "tgt_raw": tgt,
-                "source": "train_segmented",
-            })
-    else:
+        if pairs:
+            path_b_stats["matched"] += 1
+            for src, tgt in pairs:
+                path_b_pairs.append({
+                    "oare_id": oid,
+                    "src_raw": src,
+                    "tgt_raw": tgt,
+                    "source": "train_segmented",
+                })
+        else:
+            path_b_stats["unmatched"] += 1
+    except Exception as e:
+        print(f"  WARNING: Path B extraction failed for {oid}: {e}")
         path_b_stats["unmatched"] += 1
 
 path_b_df = pd.DataFrame(path_b_pairs)
@@ -425,41 +455,49 @@ if len(path_b_df) > 0:
 # train.csv. These are entirely new training data.
 
 # %%
-# IDs: Sentences_Oare ∩ published_texts - train.csv
-path_c_target_ids = (sent_uuids & pub_ids) - train_ids
+# IDs: Sentences_Oare ∩ published_texts - train.csv - test.csv
+# CRITICAL: Exclude test IDs to prevent leakage of test transliterations into training
+path_c_target_ids = (sent_uuids & pub_ids) - train_ids - test_ids
 print(f"Path C — New Document Extraction:")
 print(f"  Target documents: {len(path_c_target_ids)}")
+if test_ids:
+    leaked = (sent_uuids & pub_ids) & test_ids
+    print(f"  Excluded test documents: {len(leaked)} (leakage prevention)")
 
 path_c_pairs = []
 path_c_stats = {"matched": 0, "unmatched": 0, "no_trans": 0}
 
 for oid in tqdm(path_c_target_ids, desc="Path C"):
-    pub_row = published_df[published_df["oare_id"] == oid]
-    if pub_row.empty:
-        path_c_stats["no_trans"] += 1
-        continue
+    try:
+        pub_row = published_df[published_df["oare_id"] == oid]
+        if pub_row.empty:
+            path_c_stats["no_trans"] += 1
+            continue
 
-    transliteration = pub_row.iloc[0].get("transliteration", "")
-    if not transliteration or str(transliteration) == "nan":
-        path_c_stats["no_trans"] += 1
-        continue
+        transliteration = pub_row.iloc[0].get("transliteration", "")
+        if not transliteration or str(transliteration) == "nan":
+            path_c_stats["no_trans"] += 1
+            continue
 
-    sent_rows = sentences_df[sentences_df["text_uuid"] == oid]
-    if sent_rows.empty:
-        continue
+        sent_rows = sentences_df[sentences_df["text_uuid"] == oid]
+        if sent_rows.empty:
+            continue
 
-    pairs = extract_sentence_pairs(transliteration, sent_rows)
+        pairs = extract_sentence_pairs(transliteration, sent_rows)
 
-    if pairs:
-        path_c_stats["matched"] += 1
-        for src, tgt in pairs:
-            path_c_pairs.append({
-                "oare_id": oid,
-                "src_raw": src,
-                "tgt_raw": tgt,
-                "source": "new_segmented",
-            })
-    else:
+        if pairs:
+            path_c_stats["matched"] += 1
+            for src, tgt in pairs:
+                path_c_pairs.append({
+                    "oare_id": oid,
+                    "src_raw": src,
+                    "tgt_raw": tgt,
+                    "source": "new_segmented",
+                })
+        else:
+            path_c_stats["unmatched"] += 1
+    except Exception as e:
+        print(f"  WARNING: Path C extraction failed for {oid}: {e}")
         path_c_stats["unmatched"] += 1
 
 path_c_df = pd.DataFrame(path_c_pairs)
@@ -478,10 +516,17 @@ if len(path_c_df) > 0:
 # ## 9. Combine All Paths
 
 # %%
-combined = pd.concat([path_a_df, path_b_df, path_c_df], ignore_index=True)
+# Path A/B dedup: when Path B provides sentence-level pairs for a document,
+# the document-level Path A pair is redundant (lower quality unsegmented text).
+# Remove Path A entries that are superseded by Path B's finer segmentation.
+path_b_doc_ids = set(path_b_df["oare_id"].unique()) if len(path_b_df) > 0 else set()
+path_a_deduped = path_a_df[~path_a_df["oare_id"].isin(path_b_doc_ids)]
+n_a_removed = len(path_a_df) - len(path_a_deduped)
+
+combined = pd.concat([path_a_deduped, path_b_df, path_c_df], ignore_index=True)
 
 print(f"Combined dataset (before cleaning):")
-print(f"  Path A (train_document):  {len(path_a_df):>6,}")
+print(f"  Path A (train_document):  {len(path_a_df):>6,} → {len(path_a_deduped):>6,} ({n_a_removed} superseded by Path B)")
 print(f"  Path B (train_segmented): {len(path_b_df):>6,}")
 print(f"  Path C (new_segmented):   {len(path_c_df):>6,}")
 print(f"  {'─' * 35}")
@@ -633,35 +678,42 @@ import json
 
 print("Building glossary from OA_Lexicon + eBL_Dictionary...")
 
-# Build form → lemma mapping
-form_to_lemma = {}
+# Build form → lexeme mapping (NFC-normalize keys for consistent lookup)
+# OA_Lexicon columns: type, form, norm, lexeme, eBL, ...
+form_to_lexeme = {}
 for _, row in lexicon_df.iterrows():
     form = row.get("form")
-    lemma = row.get("lemma")
-    if pd.notna(form) and pd.notna(lemma):
-        form_str = str(form).strip()
-        lemma_str = str(lemma).strip()
-        if form_str and lemma_str:
-            form_to_lemma[form_str] = lemma_str
+    lexeme = row.get("lexeme")  # NOT "lemma" — actual column name is "lexeme"
+    if pd.notna(form) and pd.notna(lexeme):
+        form_str = unicodedata.normalize("NFC", str(form).strip())
+        lexeme_str = unicodedata.normalize("NFC", str(lexeme).strip())
+        if form_str and lexeme_str:
+            form_to_lexeme[form_str] = lexeme_str
 
-# Build lemma → definition mapping
-lemma_to_def = {}
+# Build word → definition mapping from eBL_Dictionary (NFC-normalize keys)
+# eBL_Dictionary columns: word, definition, derived_from
+# Dictionary words have Roman numeral suffixes (e.g. "abālu I") — strip them for matching
+word_to_def = {}
 for _, row in dictionary_df.iterrows():
     word = row.get("word")
     definition = row.get("definition")
     if pd.notna(word) and pd.notna(definition):
-        word_str = str(word).strip()
+        word_str = unicodedata.normalize("NFC", str(word).strip())
         def_str = str(definition).strip()
         if word_str and def_str and len(def_str) > 1:
-            lemma_to_def[word_str] = def_str
+            word_to_def[word_str] = def_str
+            # Also index by stripped form (remove trailing " I", " II", etc.)
+            stripped = re.sub(r"\s+[IVX]+$", "", word_str)
+            if stripped and stripped != word_str and stripped not in word_to_def:
+                word_to_def[stripped] = def_str
 
-print(f"  Form → Lemma mappings: {len(form_to_lemma):,}")
-print(f"  Lemma → Definition mappings: {len(lemma_to_def):,}")
+print(f"  Form → Lexeme mappings: {len(form_to_lexeme):,}")
+print(f"  Word → Definition mappings: {len(word_to_def):,}")
 
-# Join: form → lemma → definition
+# Join: form → lexeme → definition
 glossary = {}
-for form, lemma in form_to_lemma.items():
-    definition = lemma_to_def.get(lemma, "")
+for form, lexeme in form_to_lexeme.items():
+    definition = word_to_def.get(lexeme, "")
     if definition:
         # Take first sense, strip grammar notes
         first_sense = definition.split(";")[0].split(",")[0].strip()
@@ -686,11 +738,20 @@ import random
 
 random.seed(SEED)
 
-unique_ids = combined["oare_id"].dropna().unique().tolist()
-random.shuffle(unique_ids)
+# Stratified split: ensure proportional representation of each source type
+# Group documents by their primary source type (the majority source for that doc)
+doc_source = combined.groupby("oare_id")["source"].agg(lambda x: x.mode()[0]).to_dict()
 
-n_val = max(1, int(len(unique_ids) * VAL_FRAC))
-val_ids = set(unique_ids[:n_val])
+val_ids = set()
+# Split within each source group to maintain distribution
+source_groups = {}
+for oid, src in doc_source.items():
+    source_groups.setdefault(src, []).append(oid)
+
+for src, ids in source_groups.items():
+    random.shuffle(ids)
+    n_val_src = max(1, int(len(ids) * VAL_FRAC))
+    val_ids.update(ids[:n_val_src])
 
 train_df = combined[~combined["oare_id"].isin(val_ids)].reset_index(drop=True)
 val_df = combined[combined["oare_id"].isin(val_ids)].reset_index(drop=True)

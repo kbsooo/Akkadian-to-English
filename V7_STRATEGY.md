@@ -43,7 +43,7 @@ These are **final decisions**, not options. The reasoning is documented but the 
 
 ### 2.1 Model: ByT5-small (keep)
 
-ByT5-small (80M params) is the correct choice at 8–12K training examples. Research shows ByT5 outperforms mT5 by +2–5 chrF++ in the 400–10K data regime because mT5-base has 85% of parameters locked in embedding layers. ByT5's byte-level tokenization also handles Akkadian diacritics and special characters natively. If V7 data exceeds 15K pairs, reconsider ByT5-base.
+ByT5-small (~300M params, verified: d_model=1472, 12 enc + 4 dec layers, gated-gelu FFN) is the correct choice at 8–12K training examples. Research shows ByT5 outperforms mT5 by +2–5 chrF++ in the 400–10K data regime because mT5-base has ~33% of parameters locked in its 250K-vocab embedding layers, while ByT5-small's 384-token byte vocabulary uses only 0.2% for embeddings — virtually all ~300M parameters go into transformer computation. ByT5's byte-level tokenization also handles Akkadian diacritics and special characters natively. If V7 data exceeds 15K pairs, reconsider ByT5-base (~580M).
 
 ### 2.2 Max sequence length: 384 (up from 256)
 
@@ -170,7 +170,7 @@ V6's `src_raw` had already lost diacritics for 55% of extracted pairs (`annotate
 ### 5.1 Configuration
 
 ```python
-model_name = "google/byt5-small"           # 80M params
+model_name = "google/byt5-small"           # ~300M params (d_model=1472, 12+4 layers)
 max_source_length = 384                     # up from 256
 max_target_length = 384                     # up from 256
 epochs = 15

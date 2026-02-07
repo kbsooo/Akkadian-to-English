@@ -11,20 +11,20 @@
 
 핵심 이유:
 
-**mT5-base의 문제점:** 580M 파라미터 중 약 85%가 임베딩 레이어에 묶여 있다. 실제 트랜스포머 연산에 쓰이는 파라미터는 ByT5-small과 비슷하거나 적다. 8,000 예제에서 580M 파라미터를 풀 파인튜닝하면 파라미터/토큰 비율이 725:1로, 오버피팅 위험이 높다.
+**mT5-base의 문제점:** 580M 파라미터 중 약 33%가 250K-vocab 임베딩 레이어에 묶여 있다 (250,112 × 768 × 2 ≈ 384M, 입출력 합산). 실제 트랜스포머 연산에 쓰이는 파라미터는 ~196M. 8,000 예제에서 풀 파인튜닝하면 오버피팅 위험이 높다.
 
-**ByT5-small의 장점:** 80M 파라미터 중 0.3%만 임베딩에 사용. 바이트 레벨 토큰화로 아카드어의 다이어크리틱, 특수문자를 자연스럽게 처리. 파라미터/토큰 비율이 100:1로 건강한 범위.
+**ByT5-small의 장점:** ~300M 파라미터 중 0.2%만 임베딩에 사용 (384 vocab × 1472 d_model = 565K). 거의 모든 파라미터가 트랜스포머 레이어에 투입됨. 바이트 레벨 토큰화로 아카드어의 다이어크리틱, 특수문자를 자연스럽게 처리.
 
 **그러나 고려할 대안:**
 
-| 옵션 | 장점 | 단점 |
-|------|------|------|
-| ByT5-small (현재) | 오버피팅 낮음, 바이트 처리 우수 | 용량 한계 |
-| ByT5-base (250M) | 2x 용량, 같은 아키텍처 | 학습 시간 2-3x |
-| ByT5-small + LoRA→base | base의 지식 활용, small 수준 파라미터 | 구현 복잡 |
-| mT5-base + LoRA (r=8) | 유효 파라미터 ~5M, 다국어 지식 | 아카드어 토큰화 문제 |
+| 옵션 | 총 파라미터 | 유효 트랜스포머 파라미터 | 장점 | 단점 |
+|------|-----------|---------------------|------|------|
+| ByT5-small (현재) | ~300M | ~299M (99.8%) | 오버피팅 낮음, 바이트 처리 우수 | 12 enc + 4 dec 레이어 |
+| ByT5-base | ~580M | ~579M (99.9%) | 2x 용량, 같은 아키텍처 | 학습 시간 2-3x |
+| mT5-base | 580M | ~196M (33.8%) | 다국어 사전학습 | 250K 임베딩에 파라미터 낭비 |
+| mT5-base + LoRA (r=8) | 580M+~5M | ~5M trainable | 다국어 지식 활용 | 아카드어 토큰화 미지원 |
 
-**V7 권장:** ByT5-small 유지하되, 데이터를 12K+ 이상으로 늘리면 ByT5-base로 전환 검토. 현재 8K 데이터에서는 ByT5-small이 최적.
+**V7 권장:** ByT5-small 유지. ~300M 파라미터 중 거의 전부가 트랜스포머에 투입되어, 유효 연산 능력은 mT5-base보다 높음. 데이터가 15K+ 이상으로 늘면 ByT5-base로 전환 검토.
 
 ---
 
@@ -107,31 +107,33 @@ word: "šarru(m)"    → definition: "king"
 
 **주의:** 훈련 데이터로 직접 넣기보다는, **inference 시 glossary lookup**으로 사용하는 게 더 적절
 
-### 3.3 Published_texts — 가장 큰 기회지만 제약 있음
+### 3.3 Published_texts — Transliteration만 있음 (번역 없음)
 
 **파일:** `published_texts.csv` (7,953 documents)
 
-**핵심 발견:** `AICC_translation` 컬럼은 번역 텍스트가 아니라 **URL**이다!
+**핵심 발견:** `AICC_translation` 컬럼은 번역 텍스트가 아니라 **OARE API URL**이다!
 
 ```
 예: "https://oare.byu.edu/api/texts/3e87aad8-.../translations"
 ```
 
-즉, 실제 번역은 OARE 웹사이트에서 스크래핑해야 한다. 하지만:
-- 대회 규칙상 외부 데이터 사용 가능 (freely & publicly available)
-- 9시간 제한은 inference 노트북에만 적용
-- 데이터 준비는 오프라인으로 가능
+**따라서 published_texts 자체에서는 번역 쌍을 직접 추출할 수 없다.** 번역은 Sentences_Oare에서만 얻을 수 있으며, published_texts의 역할은 **transliteration 원문 제공** (Sentences_Oare의 text_uuid로 조인 시 first-word anchor로 문장 분할에 사용).
 
-**활용 방법:**
+**OARE API 스크래핑 가능성:**
+- 이론적으로 7,953개 URL에서 번역을 가져올 수 있음
+- 하지만 OARE API 접근성/안정성이 불확실
+- 대회 규칙상 "freely & publicly available" 데이터 사용 가능
+- **V7에서는 미구현** — Sentences_Oare 조인으로 충분한 데이터 확보 가능
+
+**현재 활용 방식 (V7):**
 ```
-1. OARE API에서 번역 스크래핑 (7,953 URLs)
-2. Transliteration + Translation 쌍 구성
-3. 품질 필터링 (길이 비율, 언어 감지)
-4. V7 데이터에 추가
+1. published_texts의 transliteration + text_uuid 사용
+2. Sentences_Oare와 text_uuid로 조인
+3. first_word_spelling으로 문장 위치 앵커링
+4. 원문 transliteration에서 문장 범위 추출
 ```
 
-**예상 추가:** +2,800~5,600쌍 (스크래핑 성공률 50-100%)
-**구현 난이도:** MEDIUM (API 호출 + 파싱)
+**V7 데이터 예상:** Sentences_Oare 조인으로 ~7,263쌍 추출 가능 (Path C)
 
 ### 3.4 OA_Lexicon_eBL — 전처리 지원
 
@@ -156,13 +158,13 @@ form: "KU.BABBAR"   → lemma: "kaspum" (= silver)
 
 | 소스 | 방법 | 추가 쌍 | 품질 | 구현 시간 |
 |------|------|---------|------|----------|
-| Sentences_Oare (미추출분) | threshold 완화 | +2,360 | HIGH | 30분 |
-| eBL Dict + Lexicon | lemma join | glossary 3,000+ | MEDIUM | 2시간 |
-| Published_texts | OARE API 스크래핑 | +2,800~5,600 | VARIABLE | 1일 |
-| **합계 (보수적)** | | **+2,360** | | **30분** |
-| **합계 (적극적)** | | **+5,160~7,960** | | **1일** |
+| Sentences_Oare (미추출분) | minimal-norm 매칭 (V7) | +2,360 | HIGH | 30분 |
+| eBL Dict + Lexicon | lemma join → glossary | glossary 3,000+ | MEDIUM | 2시간 |
+| OARE API (선택) | URL 스크래핑 | +2,800~5,600 | VARIABLE/불확실 | 1일 |
+| **합계 (V7 기본)** | | **+2,360 + glossary** | | **2.5시간** |
+| **합계 (API 포함)** | | **+5,160~7,960** | | **1일+** |
 
-**V7 목표 데이터 크기:** 7,391 → 9,751 (보수적) ~ 15,351 (적극적)
+**V7 목표 데이터 크기:** ~9,500-10,000쌍 (Path A: 1,561 + Path B: ~1,213 + Path C: ~7,263)
 
 ---
 

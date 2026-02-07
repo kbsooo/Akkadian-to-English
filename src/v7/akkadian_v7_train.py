@@ -1,8 +1,18 @@
 # %% [markdown]
-# # V7 Training — ByT5-small Akkadian→English
+# # V7 Training — ByT5-small Akkadian→English (Colab A100 40GB)
+#
+# ### A100 Optimizations vs T4
+# | Feature | T4 16GB | A100 40GB |
+# |---------|---------|-----------|
+# | Precision | FP32 only | **BF16** (same range as FP32, safe for ByT5) |
+# | Batch | 8 | **32** (4× larger, fewer steps) |
+# | Grad checkpointing | ON (saves VRAM) | **OFF** (no recomputation, ~20% faster) |
+# | TF32 matmul | N/A | **ON** (3× faster FP32 matmuls via Tensor Cores) |
+# | torch.compile | N/A | **ON** (graph fusion, ~10-15% speedup) |
+# | **Net speedup** | baseline | **~5-8× faster** |
 
 # %% [markdown]
-# Configuration for V7 training. Edit KAGGLE_USERNAME to your username.
+# Configuration for V7 training — A100 optimized
 
 # %%
 KAGGLE_USERNAME = "your-username"  # EDIT THIS
@@ -13,21 +23,22 @@ OUTPUT_DIR = "outputs_v7"
 MAX_SOURCE_LENGTH = 384
 MAX_TARGET_LENGTH = 384
 EPOCHS = 15
-BATCH_SIZE = 4
-GRAD_ACCUM = 4  # effective batch = 16
-LR = 1e-4
+BATCH_SIZE = 32      # A100 40GB + BF16 + no grad ckpt → batch=32 fits easily
+GRAD_ACCUM = 1       # effective batch = 32 × 1 = 32
+LR = 7e-5            # sqrt-scaled from 5e-5: LR × sqrt(32/16) ≈ 7e-5
 WARMUP_RATIO = 0.1
-WEIGHT_DECAY = 0.01
-EARLY_STOPPING_PATIENCE = 3
+WEIGHT_DECAY = 0.005
+EARLY_STOPPING_PATIENCE = 5
+LABEL_SMOOTHING = 0.1
 SEED = 42
 
-print("Configuration:")
+print("Configuration (A100 40GB):")
 print(f"  Model: {MODEL_NAME}")
-print(f"  Max source length: {MAX_SOURCE_LENGTH}")
-print(f"  Max target length: {MAX_TARGET_LENGTH}")
+print(f"  Max length: {MAX_SOURCE_LENGTH}")
 print(f"  Epochs: {EPOCHS}")
-print(f"  Effective batch size: {BATCH_SIZE * GRAD_ACCUM}")
-print(f"  Learning rate: {LR}")
+print(f"  Batch: {BATCH_SIZE} × {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM} effective")
+print(f"  LR: {LR} (sqrt-scaled for batch=32)")
+print(f"  Label smoothing: {LABEL_SMOOTHING}")
 print(f"  Seed: {SEED}")
 
 # %% [markdown]
@@ -69,8 +80,15 @@ set_seed(SEED)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
 if device.type == "cuda":
-    print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"GPU: {gpu_name}")
+    print(f"VRAM: {gpu_mem:.1f} GB")
+    # TF32: A100 Tensor Cores can do FP32 matmuls at TF32 precision (~3× faster)
+    # Negligible accuracy impact (19-bit mantissa precision vs 23-bit)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    print("TF32 matmul: ENABLED (A100 Tensor Cores)")
 
 # %% [markdown]
 # Download V7 data from Kaggle
@@ -181,24 +199,37 @@ print(train_df["tgt"].str.len().describe())
 
 # %%
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+# Load in BF16 directly — halves memory from the start, A100 computes BF16 natively
+model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME, torch_dtype=torch.bfloat16)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"Model: {MODEL_NAME}")
 print(f"Parameters: {n_params:,}")
+print(f"Dtype: {next(model.parameters()).dtype}")
 print(f"Tokenizer vocab: {len(tokenizer)}")
+
+# torch.compile: fuses ops, reduces kernel launch overhead (~10-15% speedup)
+# "reduce-overhead" mode best for small models with many short sequences
+try:
+    model = torch.compile(model, mode="reduce-overhead")
+    print("torch.compile: ENABLED (reduce-overhead)")
+except Exception as e:
+    print(f"torch.compile: SKIPPED ({e})")
 
 # %% [markdown]
 # Tokenize datasets
 
 # %%
 def tokenize_fn(examples):
+    # text_target ensures decoder-side tokenization (adds decoder_start_token_id prefix)
+    # Without it, labels lack proper BOS handling for T5's decoder
     model_inputs = tokenizer(
         examples["src"], max_length=MAX_SOURCE_LENGTH,
-        truncation=True, padding=False)
-    labels = tokenizer(
-        examples["tgt"], max_length=MAX_TARGET_LENGTH,
-        truncation=True, padding=False)
-    model_inputs["labels"] = labels["input_ids"]
+        truncation=True, padding=False,
+        text_target=examples["tgt"])
+    # text_target already populates model_inputs["labels"] correctly
+    # Truncate target side separately
+    labels = model_inputs["labels"]
+    model_inputs["labels"] = [l[:MAX_TARGET_LENGTH] for l in labels]
     return model_inputs
 
 train_ds = Dataset.from_pandas(train_df[["src", "tgt"]])
@@ -291,14 +322,21 @@ training_args = Seq2SeqTrainingArguments(
     output_dir=f"{OUTPUT_DIR}/checkpoints",
     num_train_epochs=EPOCHS,
     per_device_train_batch_size=BATCH_SIZE,
-    per_device_eval_batch_size=BATCH_SIZE * 2,
+    per_device_eval_batch_size=BATCH_SIZE * 2,  # 64: no grad → fits easily
     gradient_accumulation_steps=GRAD_ACCUM,
     learning_rate=LR,
     weight_decay=WEIGHT_DECAY,
     warmup_ratio=WARMUP_RATIO,
+    lr_scheduler_type="cosine",
+    label_smoothing_factor=LABEL_SMOOTHING,
     max_grad_norm=1.0,
-    fp16=False,  # ByT5 requires FP32
-    bf16=False,
+    # BF16: same exponent range as FP32 (8 bits), so ByT5's byte embeddings don't overflow
+    # Unlike FP16 (5-bit exponent, max 65504) which causes NaN with ByT5
+    fp16=False,
+    bf16=True,
+    # No gradient checkpointing: A100 40GB has plenty of VRAM at batch=32 + BF16
+    # Skipping saves ~20% training time by avoiding activation recomputation
+    gradient_checkpointing=False,
     eval_strategy="epoch",
     save_strategy="epoch",
     save_total_limit=3,
@@ -307,17 +345,25 @@ training_args = Seq2SeqTrainingArguments(
     greater_is_better=True,
     predict_with_generate=True,
     generation_max_length=MAX_TARGET_LENGTH,
-    dataloader_num_workers=2,
-    logging_steps=50,
+    generation_num_beams=4,
+    # Colab A100 has 12 CPU cores — use more workers for data loading
+    dataloader_num_workers=4,
+    dataloader_pin_memory=True,
+    logging_steps=25,  # fewer steps per epoch at batch=32, log more frequently
     report_to="none",
     seed=SEED,
+    # torch.compile wraps forward as (*args, **kwargs), which can break
+    # Trainer's signature-based column pruning. Keep dataset columns as-is.
+    remove_unused_columns=False,
 )
 
-print("Training arguments configured")
-print(f"  Epochs: {EPOCHS}")
-print(f"  Effective batch size: {BATCH_SIZE * GRAD_ACCUM}")
-print(f"  Max length: {MAX_SOURCE_LENGTH}")
-print(f"  fp16: False (ByT5 requires FP32)")
+print("Training arguments configured (A100)")
+print(f"  Effective batch: {BATCH_SIZE * GRAD_ACCUM}")
+print(f"  BF16: ON (A100 native)")
+print(f"  Gradient checkpointing: OFF (40GB sufficient)")
+print(f"  TF32 matmul: ON")
+print(f"  torch.compile: ON")
+print(f"  LR: {LR} (cosine → 0)")
 
 # %% [markdown]
 # Create trainer and start training
@@ -334,7 +380,7 @@ trainer = Seq2SeqTrainer(
     args=training_args,
     train_dataset=train_ds,
     eval_dataset=val_ds,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,  # renamed from `tokenizer` in transformers >= 4.46
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     callbacks=callbacks,
@@ -368,6 +414,9 @@ config_info = {
     "max_source_length": MAX_SOURCE_LENGTH,
     "max_target_length": MAX_TARGET_LENGTH,
     "epochs": EPOCHS,
+    "effective_batch": BATCH_SIZE * GRAD_ACCUM,
+    "learning_rate": LR,
+    "bf16": True,
     "normalization": "v7_preserve_diacritics",
 }
 with open(f"{final_dir}/v7_config.json", "w") as f:

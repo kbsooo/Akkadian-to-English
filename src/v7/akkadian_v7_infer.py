@@ -16,7 +16,6 @@ import torch
 import os
 import re
 import unicodedata
-import copy
 import json
 import difflib
 import time
@@ -97,9 +96,12 @@ model.eval()
 if n_gpus >= 2:
     print("Setting up dual-GPU inference...")
     model_0 = model.to('cuda:0')
-    model_1 = copy.deepcopy(model).to('cuda:1')
+    # Reload from disk instead of deepcopy — avoids doubling CPU memory peak
+    # and is more reliable across different model architectures
+    model_1 = AutoModelForSeq2SeqLM.from_pretrained(str(MODEL_DIR), local_files_only=True)
+    model_1 = model_1.eval().to('cuda:1')
     print(f"  Model on cuda:0: OK")
-    print(f"  Model on cuda:1: OK")
+    print(f"  Model on cuda:1: OK (loaded from disk)")
     del model  # Free CPU memory
 else:
     print("Single GPU mode")
@@ -200,35 +202,60 @@ _chrf_scorer = CHRF(word_order=2)
 
 @torch.no_grad()
 def mbr_decode(model, tokenizer, source_text, n=8, device='cuda:0'):
-    """Generate n candidates via beam search, pick consensus translation."""
+    """
+    Generate n diverse candidates via sampling, pick consensus translation.
+
+    Beam search produces near-identical candidates (low diversity).
+    Sampling with temperature creates genuinely different translations,
+    which is essential for MBR consensus to work effectively.
+    """
     inputs = tokenizer(source_text, return_tensors="pt", truncation=True,
                        max_length=MAX_SOURCE_LENGTH).to(device)
-    
-    outputs = model.generate(
-        **inputs,
-        num_beams=n,
-        num_return_sequences=n,
-        max_length=MAX_TARGET_LENGTH,
-        early_stopping=True,
-    )
+
+    try:
+        # Sampling-based generation for diverse candidates
+        outputs = model.generate(
+            **inputs,
+            do_sample=True,
+            top_k=50,
+            top_p=0.95,
+            temperature=0.8,
+            num_return_sequences=n,
+            max_length=MAX_TARGET_LENGTH,
+        )
+    except RuntimeError as e:
+        # OOM fallback: reduce candidates, use greedy
+        if "out of memory" in str(e).lower():
+            torch.cuda.empty_cache()
+            print(f"  OOM in MBR, falling back to greedy for: '{source_text[:40]}...'")
+            outputs = model.generate(
+                **inputs,
+                max_length=MAX_TARGET_LENGTH,
+                num_beams=1,
+            )
+        else:
+            raise
+
     candidates = [tokenizer.decode(o, skip_special_tokens=True) for o in outputs]
-    
+
     # Remove empty/duplicate candidates
     candidates = list(dict.fromkeys([c for c in candidates if c.strip()]))
     if len(candidates) == 0:
         return ""
     if len(candidates) == 1:
         return candidates[0]
-    
+
     # Score each candidate against all others using chrF++
-    best_score, best_idx = -1, 0
-    for i, cand in enumerate(candidates):
-        others = [c for j, c in enumerate(candidates) if j != i]
-        avg = sum(_chrf_scorer.corpus_score([cand], [[r]]).score for r in others) / len(others)
-        if avg > best_score:
-            best_score, best_idx = avg, i
-    
-    return candidates[best_idx]
+    # Precompute all pairwise scores to avoid O(n²) redundant calls
+    n_cand = len(candidates)
+    scores = np.zeros(n_cand)
+    for i in range(n_cand):
+        for j in range(n_cand):
+            if i != j:
+                scores[i] += _chrf_scorer.corpus_score([candidates[i]], [[candidates[j]]]).score
+        scores[i] /= (n_cand - 1)
+
+    return candidates[int(np.argmax(scores))]
 
 # Test MBR
 test_mbr = mbr_decode(model_0, tokenizer, normalized[0], n=MBR_N_CANDIDATES, device='cuda:0')
@@ -379,7 +406,8 @@ def enforce_consistency(translations, text_ids):
             used.add(name.lower())
         for idx in indices:
             for wrong, right in canonical.items():
-                translations[idx] = translations[idx].replace(wrong, right)
+                # Word boundary matching to avoid partial replacement (e.g. "Aššur" inside "Puzur-Aššur")
+                translations[idx] = re.sub(r'\b' + re.escape(wrong) + r'\b', right, translations[idx])
     
     return translations
 
