@@ -1,5 +1,5 @@
 # %% [markdown]
-# # V7 Training — ByT5-small Akkadian→English (Colab A100 40GB)
+# # V7 Training (Fast Eval) — ByT5-small Akkadian→English (Colab A100 40GB)
 #
 # ### A100 Optimizations vs T4
 # | Feature | T4 16GB | A100 40GB |
@@ -18,7 +18,7 @@
 KAGGLE_USERNAME = "your-username"  # EDIT THIS
 V7_DATA_DATASET = f"{KAGGLE_USERNAME}/akkadian-v7-data"
 MODEL_NAME = "google/byt5-small"
-OUTPUT_DIR = "outputs_v7"
+OUTPUT_DIR = "outputs_v7_fast_eval"
 
 MAX_SOURCE_LENGTH = 384
 MAX_TARGET_LENGTH = 384
@@ -34,6 +34,14 @@ SEED = 42
 # torch.compile can crash with dynamic sequence lengths in HF Seq2SeqTrainer
 # (inductor size/stride assert). Keep OFF for stability unless explicitly testing it.
 USE_TORCH_COMPILE = False
+# Fast-eval settings: speed up epoch-level validation while keeping final full-val check
+FAST_EVAL = True
+FAST_EVAL_FRACTION = 0.4
+FAST_EVAL_MIN_SAMPLES = 256
+FAST_EVAL_MAX_SAMPLES = 1024
+FAST_EVAL_BEAMS = 2
+FAST_EVAL_MAX_TARGET_LENGTH = 256
+FULL_EVAL_BEAMS = 4
 
 print("Configuration (A100 40GB):")
 print(f"  Model: {MODEL_NAME}")
@@ -42,6 +50,7 @@ print(f"  Epochs: {EPOCHS}")
 print(f"  Batch: {BATCH_SIZE} × {GRAD_ACCUM} = {BATCH_SIZE * GRAD_ACCUM} effective")
 print(f"  LR: {LR} (sqrt-scaled for batch=32)")
 print(f"  Label smoothing: {LABEL_SMOOTHING}")
+print(f"  Fast eval: {'ON' if FAST_EVAL else 'OFF'}")
 print(f"  Seed: {SEED}")
 
 # %% [markdown]
@@ -121,9 +130,17 @@ train_df = pd.read_csv(f"{data_path}/v7_train.csv")
 val_df = pd.read_csv(f"{data_path}/v7_val.csv")
 train_df = train_df.dropna(subset=["src", "tgt"]).reset_index(drop=True)
 val_df = val_df.dropna(subset=["src", "tgt"]).reset_index(drop=True)
+val_eval_df = val_df.copy()
+
+if FAST_EVAL:
+    eval_n = int(len(val_df) * FAST_EVAL_FRACTION)
+    eval_n = max(FAST_EVAL_MIN_SAMPLES, eval_n)
+    eval_n = min(FAST_EVAL_MAX_SAMPLES, eval_n, len(val_df))
+    val_eval_df = val_df.sample(n=eval_n, random_state=SEED).reset_index(drop=True)
 
 print(f"Train: {len(train_df):,}")
 print(f"Val: {len(val_df):,}")
+print(f"Val for epoch eval: {len(val_eval_df):,}")
 print(f"\nSource breakdown (train):")
 print(train_df["source"].value_counts())
 print(f"\nSample src: {train_df['src'].iloc[0][:120]}")
@@ -239,11 +256,14 @@ def tokenize_fn(examples):
 
 train_ds = Dataset.from_pandas(train_df[["src", "tgt"]])
 train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"])
-val_ds = Dataset.from_pandas(val_df[["src", "tgt"]])
-val_ds = val_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"])
+val_eval_ds = Dataset.from_pandas(val_eval_df[["src", "tgt"]])
+val_eval_ds = val_eval_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"])
+val_full_ds = Dataset.from_pandas(val_df[["src", "tgt"]])
+val_full_ds = val_full_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"])
 
 print(f"Train dataset: {len(train_ds)}")
-print(f"Val dataset: {len(val_ds)}")
+print(f"Val eval dataset: {len(val_eval_ds)}")
+print(f"Val full dataset: {len(val_full_ds)}")
 print(f"Train sample keys: {train_ds[0].keys()}")
 print(f"Train sample input_ids length: {len(train_ds[0]['input_ids'])}")
 
@@ -349,8 +369,8 @@ training_args = Seq2SeqTrainingArguments(
     metric_for_best_model="eval_geo_mean",
     greater_is_better=True,
     predict_with_generate=True,
-    generation_max_length=MAX_TARGET_LENGTH,
-    generation_num_beams=4,
+    generation_max_length=FAST_EVAL_MAX_TARGET_LENGTH if FAST_EVAL else MAX_TARGET_LENGTH,
+    generation_num_beams=FAST_EVAL_BEAMS if FAST_EVAL else FULL_EVAL_BEAMS,
     # Colab A100 has 12 CPU cores — use more workers for data loading
     dataloader_num_workers=4,
     dataloader_pin_memory=True,
@@ -369,6 +389,10 @@ print(f"  Gradient checkpointing: OFF (40GB sufficient)")
 print(f"  TF32 matmul: ON")
 print(f"  torch.compile: {'ON' if USE_TORCH_COMPILE else 'OFF'}")
 print(f"  LR: {LR} (cosine → 0)")
+print(
+    f"  Epoch eval decode: beams={FAST_EVAL_BEAMS if FAST_EVAL else FULL_EVAL_BEAMS}, "
+    f"max_len={FAST_EVAL_MAX_TARGET_LENGTH if FAST_EVAL else MAX_TARGET_LENGTH}"
+)
 
 # %% [markdown]
 # Create trainer and start training
@@ -376,7 +400,7 @@ print(f"  LR: {LR} (cosine → 0)")
 # %%
 callbacks = [
     LogCallback(),
-    SampleCallback(tokenizer, val_df["src"].tolist(), device),
+    SampleCallback(tokenizer, val_eval_df["src"].tolist(), device),
     EarlyStoppingCallback(early_stopping_patience=EARLY_STOPPING_PATIENCE),
 ]
 
@@ -384,7 +408,7 @@ trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
     train_dataset=train_ds,
-    eval_dataset=val_ds,
+    eval_dataset=val_eval_ds,
     processing_class=tokenizer,  # renamed from `tokenizer` in transformers >= 4.46
     data_collator=data_collator,
     compute_metrics=compute_metrics,
@@ -398,7 +422,9 @@ trainer.train()
 # Evaluate final model
 
 # %%
-results = trainer.evaluate()
+trainer.args.generation_num_beams = FULL_EVAL_BEAMS
+trainer.args.generation_max_length = MAX_TARGET_LENGTH
+results = trainer.evaluate(eval_dataset=val_full_ds)
 print(f"\nFinal evaluation:")
 print(f"  BLEU: {results.get('eval_bleu', 0):.2f}")
 print(f"  chrF: {results.get('eval_chrf', 0):.2f}")
@@ -422,6 +448,11 @@ config_info = {
     "effective_batch": BATCH_SIZE * GRAD_ACCUM,
     "learning_rate": LR,
     "bf16": True,
+    "fast_eval": FAST_EVAL,
+    "fast_eval_fraction": FAST_EVAL_FRACTION if FAST_EVAL else 1.0,
+    "epoch_eval_beams": FAST_EVAL_BEAMS if FAST_EVAL else FULL_EVAL_BEAMS,
+    "epoch_eval_max_target_length": FAST_EVAL_MAX_TARGET_LENGTH if FAST_EVAL else MAX_TARGET_LENGTH,
+    "final_eval_beams": FULL_EVAL_BEAMS,
     "normalization": "v7_preserve_diacritics",
 }
 with open(f"{final_dir}/v7_config.json", "w") as f:
