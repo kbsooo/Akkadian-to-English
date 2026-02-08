@@ -1,35 +1,46 @@
 # %% [markdown]
-# # V7 Training — ByT5-small Akkadian→English (Kaggle T4×2)
+# # V7 Training — ByT5-small Akkadian→English (Colab T4 16GB)
 #
-# **Environment:** Kaggle Notebook, GPU T4 × 2, 9h limit
-# **Data:** `/kaggle/input/data-v7/` (pre-built V7 dataset)
-# **Output:** `/kaggle/working/outputs_v7/final/` → upload as `akkadian-v7-model`
+# **Environment:** Google Colab Free/Pro, single T4 16GB
 #
-# ### Multi-GPU Strategy
-# HuggingFace Trainer uses DataParallel automatically when 2+ GPUs detected.
-# - `per_device_train_batch_size` applies **per GPU**
-# - Effective batch = per_device × n_gpus × grad_accum = 8 × 2 × 1 = 16
-# - 2× throughput vs single-GPU with identical training dynamics
+# ### T4 Optimization Strategy
+# | Constraint | Solution |
+# |------------|----------|
+# | 16GB VRAM | Gradient checkpointing ON (~30% VRAM savings) |
+# | No BF16 | FP32 only — ByT5 NaN with FP16, T4 lacks BF16 |
+# | Slower matmul | Batch=8 + grad_accum=2 → effective=16 |
+# | Slow eval | Greedy decoding + short gen length (eval ≠ final inference) |
+# | Colab timeout | Early stopping patience=5, ~4-5h total |
 
 # %% [markdown]
 # ## Configuration
 
 # %%
+KAGGLE_USERNAME = "your-username"  # EDIT THIS
+V7_DATA_DATASET = f"{KAGGLE_USERNAME}/akkadian-v7-data"
 MODEL_NAME = "google/byt5-small"  # ~300M params (d_model=1472, 12+4 layers)
-DATA_DIR = "/kaggle/input/data-v7"
-OUTPUT_DIR = "/kaggle/working/outputs_v7"
+OUTPUT_DIR = "outputs_v7"
 
 MAX_SOURCE_LENGTH = 384
 MAX_TARGET_LENGTH = 384
 EPOCHS = 15
-BATCH_SIZE = 8       # per GPU — with gradient checkpointing, fits in T4 16GB
-GRAD_ACCUM = 1       # effective batch = 8 × 2 GPUs × 1 = 16
-LR = 5e-5            # lower LR prevents overfitting on ~8K data
+BATCH_SIZE = 8        # T4 16GB + FP32 + gradient checkpointing → batch=8 safe
+GRAD_ACCUM = 2        # effective batch = 8 × 2 = 16
+LR = 5e-5             # standard for effective batch=16
 WARMUP_RATIO = 0.1
 WEIGHT_DECAY = 0.005
-EARLY_STOPPING_PATIENCE = 5  # cosine LR converges slowly, needs patience
+EARLY_STOPPING_PATIENCE = 5
 LABEL_SMOOTHING = 0.1
 SEED = 42
+
+print("Configuration (Colab T4 16GB):")
+print(f"  Model: {MODEL_NAME}")
+print(f"  Max length: {MAX_SOURCE_LENGTH}")
+print(f"  Epochs: {EPOCHS}")
+print(f"  Batch: {BATCH_SIZE} × {GRAD_ACCUM} accum = {BATCH_SIZE * GRAD_ACCUM} effective")
+print(f"  LR: {LR}")
+print(f"  Label smoothing: {LABEL_SMOOTHING}")
+print(f"  Seed: {SEED}")
 
 # %% [markdown]
 # ## Install & Import
@@ -37,18 +48,15 @@ SEED = 42
 # %%
 import subprocess, sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "-q",
-                       "sacrebleu", "accelerate"])
+                       "kagglehub", "transformers", "datasets", "sacrebleu", "accelerate"])
+print("Dependencies installed")
 
-import os
 # %%
-# Keep transformers on PyTorch path only, and reduce TF/XLA startup noise.
-os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-
 import torch
 import numpy as np
 import pandas as pd
 import json
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -66,33 +74,40 @@ from datasets import Dataset
 from sacrebleu.metrics import BLEU, CHRF
 
 set_seed(SEED)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+if device.type == "cuda":
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+    print(f"GPU: {gpu_name}")
+    print(f"VRAM: {gpu_mem:.1f} GB")
 
 # %% [markdown]
-# ## GPU Diagnostics
+# ## Download V7 Data
 
 # %%
-n_gpus = torch.cuda.device_count()
-print(f"GPUs: {n_gpus}")
-for i in range(n_gpus):
-    name = torch.cuda.get_device_name(i)
-    mem = torch.cuda.get_device_properties(i).total_memory / 1e9
-    print(f"  [{i}] {name} — {mem:.1f} GB")
+import kagglehub
 
-effective_batch = BATCH_SIZE * n_gpus * GRAD_ACCUM
-print(f"\nTraining config:")
-print(f"  per_device_batch = {BATCH_SIZE}")
-print(f"  n_gpus = {n_gpus}")
-print(f"  grad_accum = {GRAD_ACCUM}")
-print(f"  → effective batch = {effective_batch}")
-print(f"  epochs = {EPOCHS}, LR = {LR}")
-print(f"  label_smoothing = {LABEL_SMOOTHING}")
+try:
+    data_path = kagglehub.dataset_download(V7_DATA_DATASET)
+    print(f"Data from Kaggle: {data_path}")
+except Exception as e:
+    print(f"Kaggle download failed: {e}")
+    print("Trying Google Drive...")
+    from google.colab import drive
+    drive.mount('/content/drive')
+    data_path = "/content/drive/MyDrive/akkadian/data_v7"
+
+print("\nData files:")
+for f in sorted(os.listdir(data_path)):
+    print(f"  {f}")
 
 # %% [markdown]
 # ## Load Data
 
 # %%
-train_df = pd.read_csv(f"{DATA_DIR}/v7_train.csv")
-val_df = pd.read_csv(f"{DATA_DIR}/v7_val.csv")
+train_df = pd.read_csv(f"{data_path}/v7_train.csv")
+val_df = pd.read_csv(f"{data_path}/v7_val.csv")
 train_df = train_df.dropna(subset=["src", "tgt"]).reset_index(drop=True)
 val_df = val_df.dropna(subset=["src", "tgt"]).reset_index(drop=True)
 
@@ -104,19 +119,64 @@ print(f"\nSample:")
 print(f"  src: {train_df['src'].iloc[0][:100]}...")
 print(f"  tgt: {train_df['tgt'].iloc[0][:100]}...")
 
-# Check length distribution
 pct_over = (train_df["src"].str.len() > MAX_SOURCE_LENGTH).mean() * 100
 print(f"\nSources > {MAX_SOURCE_LENGTH} chars: {pct_over:.1f}%")
+
+# %% [markdown]
+# ## V7 Normalization
+
+# %%
+_V7_TRANS_TABLE = str.maketrans({
+    "Ḫ": "H", "ḫ": "h",
+    "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+    "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9", "ₓ": "x",
+    "„": '"', "\u201c": '"', "\u201d": '"',
+    "\u2018": "'", "\u2019": "'", "\u201a": "'", "ʾ": "'", "ʿ": "'",
+})
+
+def normalize_transliteration_v7(text: str) -> str:
+    """V7 normalization: preserves š, ṣ, ṭ and vowel accents. Only Ḫ→H."""
+    if not text or (isinstance(text, float) and text != text):
+        return ""
+    text = str(text)
+    text = unicodedata.normalize("NFC", text)
+    text = text.replace("{", "(").replace("}", ")")
+    text = text.replace("<gap>", "\x00GAP\x00")
+    text = text.replace("<big_gap>", "\x00BIGGAP\x00")
+    text = re.sub(r"\b\d+'{1,2}\b", " ", text)
+    text = re.sub(r"<<([^>]+)>>", r"\1", text)
+    text = re.sub(r"<([^>]+)>", r"\1", text)
+    text = re.sub(r"\[\s*…+\s*…*\s*\]", " \x00BIGGAP\x00 ", text)
+    text = re.sub(r"\[\s*\.\.\.+\s*\]", " \x00BIGGAP\x00 ", text)
+    text = text.replace("…", " \x00BIGGAP\x00 ")
+    text = re.sub(r"\.\.\.+", " \x00BIGGAP\x00 ", text)
+    text = re.sub(r"\[\s*x\s*\]", " \x00GAP\x00 ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\[([^\]]+)\]", r"\1", text)
+    for c in "‹›⌈⌉⌊⌋˹˺":
+        text = text.replace(c, "")
+    text = text.translate(_V7_TRANS_TABLE)
+    text = re.sub(r"[!?/]", " ", text)
+    text = re.sub(r"\s*:\s*", " ", text)
+    text = re.sub(r"(?<![a-zA-Z\x00])\bx\b(?![a-zA-Z])", " \x00GAP\x00 ", text)
+    text = text.replace("\x00GAP\x00", "<gap>")
+    text = text.replace("\x00BIGGAP\x00", "<big_gap>")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+print("V7 normalization defined (preserves š, ṣ, ṭ, vowel accents)")
 
 # %% [markdown]
 # ## Load Model & Tokenizer
 
 # %%
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+# FP32: ByT5 byte embeddings cause NaN under FP16 (5-bit exponent, max 65504)
+# T4 lacks BF16 support, so FP32 is the only safe option
 model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
 n_params = sum(p.numel() for p in model.parameters())
 print(f"Model: {MODEL_NAME}")
 print(f"Parameters: {n_params:,}")
+print(f"Dtype: {next(model.parameters()).dtype}")
 
 # %% [markdown]
 # ## Tokenize
@@ -134,7 +194,7 @@ def tokenize_fn(examples):
 
 train_ds = Dataset.from_pandas(train_df[["src", "tgt"]])
 train_ds = train_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"],
-                        num_proc=2)  # parallel tokenization on Kaggle's 4-core CPU
+                        num_proc=2)
 val_ds = Dataset.from_pandas(val_df[["src", "tgt"]])
 val_ds = val_ds.map(tokenize_fn, batched=True, remove_columns=["src", "tgt"],
                     num_proc=2)
@@ -188,7 +248,7 @@ class LogCallback(TrainerCallback):
 
 
 class SampleCallback(TrainerCallback):
-    """Generate sample translations on GPU 0 after each eval."""
+    """Generate sample translations after each eval."""
     def __init__(self, tokenizer, samples):
         self.tokenizer = tokenizer
         self.samples = samples[:3]
@@ -196,28 +256,31 @@ class SampleCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, model=None, **kwargs):
         if model is None:
             return
-        # When Trainer wraps in DataParallel, unwrap to get the actual model
-        raw_model = model.module if hasattr(model, "module") else model
-        raw_model.eval()
-        device = next(raw_model.parameters()).device
+        model.eval()
+        device = next(model.parameters()).device
         print("\nSample translations:")
         for i, src in enumerate(self.samples):
             inputs = self.tokenizer(src, return_tensors="pt", truncation=True,
                                     max_length=MAX_SOURCE_LENGTH)
             inputs = {k: v.to(device) for k, v in inputs.items()}
             with torch.no_grad():
-                out = raw_model.generate(**inputs, max_length=128, num_beams=4)
+                out = model.generate(**inputs, max_length=128, num_beams=1)
             trans = self.tokenizer.decode(out[0], skip_special_tokens=True)
             print(f"  [{i}] {src[:60]}...")
-            print(f"      → {trans[:80]}")
+            print(f"      -> {trans[:80]}")
 
 # %% [markdown]
-# ## Training Arguments (T4×2 Optimized)
+# ## Training Arguments (T4 16GB Optimized)
 
 # %%
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model, padding=True)
+
+# Steps per epoch (for eval scheduling)
+steps_per_epoch = len(train_ds) // (BATCH_SIZE * GRAD_ACCUM)
+# Eval every 2 epochs to minimize ByT5's slow autoregressive eval generation
+eval_interval = steps_per_epoch * 2
 
 training_args = Seq2SeqTrainingArguments(
     output_dir=f"{OUTPUT_DIR}/checkpoints",
@@ -231,38 +294,42 @@ training_args = Seq2SeqTrainingArguments(
     lr_scheduler_type="cosine",
     label_smoothing_factor=LABEL_SMOOTHING,
     max_grad_norm=1.0,
-    # ByT5 requires FP32 — FP16 causes NaN losses due to byte-level embeddings
+    # ByT5 requires FP32 — FP16 causes NaN, T4 lacks BF16
     fp16=False,
     bf16=False,
     # Gradient checkpointing: trades ~20% speed for ~30% VRAM savings
-    # Critical for batch=8 on T4 with ByT5's 384-token byte sequences
+    # Essential for batch=8 on T4 16GB with ByT5's long byte sequences
     gradient_checkpointing=True,
-    # Eval & save
-    eval_strategy="epoch",
-    save_strategy="epoch",
+    # Eval every ~2 epochs: ByT5 byte-level generation is the dominant time cost
+    # (up to 384 autoregressive steps per sample). Training forward/backward is fast;
+    # eval generation is memory-bandwidth-bound and barely benefits from faster GPUs.
+    eval_strategy="steps",
+    eval_steps=eval_interval,
+    save_strategy="steps",
+    save_steps=eval_interval,
     save_total_limit=3,
     load_best_model_at_end=True,
     metric_for_best_model="eval_geo_mean",
     greater_is_better=True,
-    # Generation during eval — ByT5 byte-level decoding is the main bottleneck
-    # Use greedy + short max_length to keep eval fast
+    # Generation during eval — greedy + short length to keep eval fast
+    # Final inference uses beam search separately; eval only needs metric tracking
     predict_with_generate=True,
     generation_max_length=128,
     generation_num_beams=1,
-    # Kaggle has 4 CPU cores — use 2 workers per GPU for data loading
+    # Colab has 2 CPU cores — 2 workers for data loading
     dataloader_num_workers=2,
     dataloader_pin_memory=True,
-    # Misc
     logging_steps=50,
     report_to="none",
     seed=SEED,
-    # Multi-GPU: Trainer auto-detects DataParallel when CUDA_VISIBLE_DEVICES has 2+ GPUs
-    # No ddp_* args needed for Kaggle's simple 2-GPU setup
 )
 
-print("Training args configured")
-print(f"  Effective batch: {BATCH_SIZE} × {n_gpus} GPU × {GRAD_ACCUM} accum = {effective_batch}")
+print("Training args configured (T4 16GB)")
+print(f"  Effective batch: {BATCH_SIZE} × {GRAD_ACCUM} accum = {BATCH_SIZE * GRAD_ACCUM}")
 print(f"  Gradient checkpointing: ON")
+print(f"  Precision: FP32")
+print(f"  Eval every: ~2 epochs ({eval_interval} steps)")
+print(f"  Eval generation: greedy, max_length=128")
 print(f"  LR: {LR} (cosine → 0)")
 
 # %% [markdown]
@@ -286,10 +353,11 @@ trainer = Seq2SeqTrainer(
     callbacks=callbacks,
 )
 
-print(f"Starting training on {n_gpus} GPU(s)...")
+print(f"Starting training on T4 16GB...")
 print(f"  Train samples: {len(train_ds):,}")
-print(f"  Steps/epoch: ~{len(train_ds) // effective_batch}")
+print(f"  Steps/epoch: ~{steps_per_epoch}")
 print(f"  Max epochs: {EPOCHS} (early stop patience={EARLY_STOPPING_PATIENCE})")
+print(f"  Estimated time: ~4-5 hours")
 
 trainer.train()
 
@@ -310,23 +378,20 @@ print(f"  Geo:  {results.get('eval_geo_mean', 0):.2f}")
 final_dir = f"{OUTPUT_DIR}/final"
 os.makedirs(final_dir, exist_ok=True)
 
-# Unwrap DataParallel if needed
-save_model = trainer.model.module if hasattr(trainer.model, "module") else trainer.model
-save_model.save_pretrained(final_dir)
+trainer.model.save_pretrained(final_dir)
 tokenizer.save_pretrained(final_dir)
 
-# Save training config for reproducibility
 config_info = {
     "model_name": MODEL_NAME,
     "max_source_length": MAX_SOURCE_LENGTH,
     "max_target_length": MAX_TARGET_LENGTH,
     "epochs_trained": int(trainer.state.epoch),
-    "effective_batch_size": effective_batch,
+    "effective_batch_size": BATCH_SIZE * GRAD_ACCUM,
     "learning_rate": LR,
     "label_smoothing": LABEL_SMOOTHING,
-    "best_metric": results.get("eval_geo_mean", 0),
     "normalization": "v7_preserve_diacritics",
-    "n_gpus": n_gpus,
+    "gpu": "T4 16GB",
+    "precision": "FP32",
 }
 with open(f"{final_dir}/v7_config.json", "w") as f:
     json.dump(config_info, f, indent=2)
@@ -340,15 +405,14 @@ for fname in sorted(os.listdir(final_dir)):
 # ## Sanity Check
 
 # %%
-# Quick generation test on the saved model
-save_model.eval()
-device0 = torch.device("cuda:0")
-save_model = save_model.to(device0)
+model = trainer.model
+model.eval()
+device0 = next(model.parameters()).device
 
 test_input = "um-ma ka-ru-um"
 inputs = tokenizer(test_input, return_tensors="pt").to(device0)
 with torch.no_grad():
-    out = save_model.generate(**inputs, max_length=50, num_beams=4)
+    out = model.generate(**inputs, max_length=50, num_beams=4)
 translation = tokenizer.decode(out[0], skip_special_tokens=True)
 print(f"\nSanity check:")
 print(f"  Input:  '{test_input}'")
@@ -357,13 +421,14 @@ assert translation.strip() != "", "Empty output!"
 print("  OK")
 
 # %% [markdown]
-# ## Verify Output Files
+# ## Done
 #
-# After training, create a **New Dataset** on Kaggle:
-# 1. Go to kaggle.com/datasets/new
-# 2. Upload all files from `/kaggle/working/outputs_v7/final/`
-# 3. Name it `akkadian-v7-model`
-# 4. Use as input in the inference notebook
+# Upload `outputs_v7/final/` to Kaggle as Dataset `akkadian-v7-model`.
+#
+# Required files:
+# - config.json, model.safetensors
+# - tokenizer.json, tokenizer_config.json, special_tokens_map.json
+# - v7_config.json
 
 # %%
 print("\n" + "=" * 60)
@@ -373,10 +438,7 @@ print(f"  Best geo_mean: {results.get('eval_geo_mean', 0):.2f}")
 print(f"  BLEU: {results.get('eval_bleu', 0):.2f}")
 print(f"  chrF: {results.get('eval_chrf', 0):.2f}")
 print(f"  Epochs: {int(trainer.state.epoch)}")
-print(f"  GPUs used: {n_gpus}")
+print(f"  GPU: T4 16GB (FP32)")
 print(f"\n  Output: {final_dir}/")
-print(f"  Files:")
-for fname in sorted(os.listdir(final_dir)):
-    print(f"    - {fname}")
-print(f"\n  → Upload '{final_dir}/' as Kaggle Dataset 'akkadian-v7-model'")
+print(f"  -> Upload to Kaggle Dataset 'akkadian-v7-model'")
 print("=" * 60)

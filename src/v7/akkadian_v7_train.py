@@ -342,15 +342,24 @@ training_args = Seq2SeqTrainingArguments(
     # No gradient checkpointing: A100 40GB has plenty of VRAM at batch=32 + BF16
     # Skipping saves ~20% training time by avoiding activation recomputation
     gradient_checkpointing=False,
-    eval_strategy="epoch",
-    save_strategy="epoch",
+    # Eval every 2 epochs: ByT5 byte-level generation is the dominant cost
+    # (384 autoregressive steps × beam search), not training forward/backward.
+    # Halving eval frequency nearly halves total wall time.
+    eval_strategy="steps",
+    eval_steps=len(train_ds) // BATCH_SIZE,  # ~every 2 epochs (steps in 2 epochs)
+    save_strategy="steps",
+    save_steps=len(train_ds) // BATCH_SIZE,
     save_total_limit=3,
     load_best_model_at_end=True,
     metric_for_best_model="eval_geo_mean",
     greater_is_better=True,
     predict_with_generate=True,
-    generation_max_length=MAX_TARGET_LENGTH,
-    generation_num_beams=4,
+    # ByT5 bottleneck: byte-level autoregressive generation is memory-bandwidth-bound,
+    # so A100's compute advantage doesn't help. Reduce generation cost:
+    # - max_length 384→128: sufficient for BLEU/chrF estimation (avg target ~60 chars)
+    # - num_beams 4→1: greedy decoding for eval (beam search doesn't improve metric tracking)
+    generation_max_length=128,
+    generation_num_beams=1,
     # Colab A100 has 12 CPU cores — use more workers for data loading
     dataloader_num_workers=4,
     dataloader_pin_memory=True,
